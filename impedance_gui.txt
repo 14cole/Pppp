@@ -1,0 +1,2627 @@
+#!/usr/bin/env python3
+"""
+FART (Frequency-Angle Reflection Toolkit) GUI for multilayer impedance calculation.
+
+Frequency inputs and outputs are in GHz.
+Material file format (whitespace-delimited):
+    frequency_GHz eps_real eps_imag mu_real mu_imag
+"""
+
+from __future__ import annotations
+
+import bisect
+import cmath
+import math
+from dataclasses import dataclass
+from itertools import product
+from pathlib import Path
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except Exception:
+    np = None  # type: ignore[assignment]
+    NUMPY_AVAILABLE = False
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    TK_AVAILABLE = True
+except Exception:
+    TK_AVAILABLE = False
+
+    class _DummyBase:
+        pass
+
+    class _DummyTkModule:
+        Toplevel = _DummyBase
+        Tk = _DummyBase
+        END = "end"
+
+    class _DummyWidgetModule:
+        def __getattr__(self, name: str) -> object:
+            raise RuntimeError("Tkinter is not available in this Python environment.")
+
+    tk = _DummyTkModule()
+    filedialog = _DummyWidgetModule()
+    messagebox = _DummyWidgetModule()
+    ttk = _DummyWidgetModule()
+
+if TK_AVAILABLE:
+    try:
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        MPL_AVAILABLE = True
+    except Exception:
+        MPL_AVAILABLE = False
+else:
+    MPL_AVAILABLE = False
+
+
+# Vacuum constants
+MU0 = 4.0e-7 * math.pi
+EPS0 = 8.854187817e-12
+ETA0 = math.sqrt(MU0 / EPS0)
+C0 = 1.0 / math.sqrt(MU0 * EPS0)
+INCH_TO_M = 0.0254
+GHZ_TO_HZ = 1.0e9
+APP_ACRONYM = "FART"
+APP_NAME = "Frequency-Angle Reflection Toolkit"
+APP_TITLE = f"{APP_ACRONYM} - {APP_NAME}"
+ABOUT_TEXT = (
+    f"{APP_TITLE}\n\n"
+    f"Acronym: {APP_NAME}\n\n"
+    "Loss metric definitions:\n"
+    "loss_db = -20*log10(|x|)\n"
+    "metal_loss_db uses x = Gamma_metal\n"
+    "air_loss_db uses x = Gamma_air\n"
+    "insertion_loss_db uses x = S21\n\n"
+    "Sign interpretation:\n"
+    "positive loss_db => |x| < 1 (attenuation)\n"
+    "zero loss_db => |x| = 1\n"
+    "negative loss_db => |x| > 1 (effective gain/non-passive)"
+)
+
+HEATMAP_METRIC_OPTIONS = [
+    ("Metal backed loss (dB)", "metal_loss_db"),
+    ("Metal phase (deg)", "metal_phase_deg"),
+    ("Air backed loss (dB)", "air_loss_db"),
+    ("Air phase (deg)", "air_phase_deg"),
+    ("Insertion loss (dB)", "insertion_loss_db"),
+    ("Insertion phase (deg)", "insertion_phase_deg"),
+]
+HEATMAP_METRIC_KEYS = [key for _label, key in HEATMAP_METRIC_OPTIONS]
+UNCERTAINTY_VIEW_OPTIONS = [
+    ("Nominal", "nominal"),
+    ("Min", "min"),
+    ("Max", "max"),
+    ("Span (max-min)", "span"),
+]
+INVERSE_SCORE_MODE_OPTIONS = (
+    "Worst-case mean metal loss (robust)",
+    "Average mean metal loss (robust)",
+)
+
+
+@dataclass
+class MaterialTable:
+    freq_ghz: list[float]
+    eps_r: list[complex]
+    mu_r: list[complex]
+
+
+@dataclass
+class LayerConfig:
+    thickness_in: float
+    anisotropic: bool
+    file_0deg: str
+    file_90deg: str
+    polarization_deg: float
+
+
+@dataclass
+class LoadedLayer:
+    thickness_m: float
+    anisotropic: bool
+    polarization_deg: float
+    table_0deg: MaterialTable
+    table_90deg: MaterialTable | None
+
+
+@dataclass
+class UncertaintyConfig:
+    enabled: bool
+    thickness_pct: float
+    eps_pct: float
+    mu_pct: float
+
+
+@dataclass
+class InverseCandidate:
+    score_db: float
+    nominal_mean_db: float
+    worst_mean_db: float
+    avg_mean_db: float
+    best_mean_db: float
+    thickness_in: list[float]
+    material_files: list[str]
+
+
+def make_sweep(f_start: float, f_stop: float, f_step: float) -> list[float]:
+    if f_step <= 0:
+        raise ValueError("f_step must be > 0.")
+    if f_stop < f_start:
+        raise ValueError("f_stop must be >= f_start.")
+    count = int(math.floor((f_stop - f_start) / f_step + 1e-12)) + 1
+    if count <= 0:
+        raise ValueError("Frequency sweep is empty.")
+    return [f_start + i * f_step for i in range(count)]
+
+
+def normalize_backing(backing: str) -> str:
+    b = backing.strip().lower().replace("_", "-")
+    if b == "pec":
+        return "pec"
+    if b in {"air", "free-space", "freespace"}:
+        return "air"
+    raise ValueError(f"Unsupported backing: {backing}")
+
+
+def read_material_table(path: Path, skiprows: int) -> MaterialTable:
+    rows: list[tuple[float, complex, complex]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            if idx < skiprows:
+                continue
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if len(parts) < 5:
+                raise ValueError(
+                    f"{path}: line {idx + 1} expected 5 columns, found {len(parts)}."
+                )
+            freq_ghz = float(parts[0])
+            eps = complex(float(parts[1]), float(parts[2]))
+            mu = complex(float(parts[3]), float(parts[4]))
+            rows.append((freq_ghz, eps, mu))
+
+    if len(rows) < 2:
+        raise ValueError(f"{path}: at least two valid data rows are required.")
+
+    rows.sort(key=lambda r: r[0])
+    return MaterialTable(
+        freq_ghz=[r[0] for r in rows],
+        eps_r=[r[1] for r in rows],
+        mu_r=[r[2] for r in rows],
+    )
+
+
+def interp_complex(x: float, xp: list[float], fp: list[complex]) -> complex:
+    if x < xp[0] or x > xp[-1]:
+        raise ValueError("Interpolation query is out of bounds.")
+    i = bisect.bisect_left(xp, x)
+    if i == 0:
+        return fp[0]
+    if i == len(xp):
+        return fp[-1]
+    if xp[i] == x:
+        return fp[i]
+    x0 = xp[i - 1]
+    x1 = xp[i]
+    t = (x - x0) / (x1 - x0)
+    return fp[i - 1] + t * (fp[i] - fp[i - 1])
+
+
+def interp_complex_many(x: list[float], xp: list[float], fp: list[complex]) -> list[complex]:
+    if x[0] < xp[0] or x[-1] > xp[-1]:
+        raise ValueError("Interpolation query is out of bounds.")
+    if NUMPY_AVAILABLE:
+        x_arr = np.asarray(x, dtype=float)
+        xp_arr = np.asarray(xp, dtype=float)
+        fp_arr = np.asarray(fp, dtype=complex)
+        re = np.interp(x_arr, xp_arr, fp_arr.real)
+        im = np.interp(x_arr, xp_arr, fp_arr.imag)
+        return (re + 1j * im).tolist()
+    return [interp_complex(v, xp, fp) for v in x]
+
+
+def validate_sweep_coverage(sweep: list[float], table: MaterialTable, label: str) -> None:
+    if sweep[0] < table.freq_ghz[0] or sweep[-1] > table.freq_ghz[-1]:
+        raise ValueError(
+            f"Sweep [{sweep[0]}, {sweep[-1]}] GHz is outside {label} data range "
+            f"[{table.freq_ghz[0]}, {table.freq_ghz[-1]}] GHz."
+        )
+
+
+def mix_anisotropic(
+    eps_0: complex,
+    mu_0: complex,
+    eps_90: complex,
+    mu_90: complex,
+    polarization_deg: float,
+) -> tuple[complex, complex]:
+    theta = math.radians(polarization_deg)
+    w0 = math.cos(theta) ** 2
+    w90 = math.sin(theta) ** 2
+    eps_eff = eps_0 * w0 + eps_90 * w90
+    mu_eff = mu_0 * w0 + mu_90 * w90
+    return eps_eff, mu_eff
+
+
+def mix_anisotropic_many(
+    eps_0: list[complex],
+    mu_0: list[complex],
+    eps_90: list[complex],
+    mu_90: list[complex],
+    polarization_deg: float,
+) -> tuple[list[complex], list[complex]]:
+    if not (len(eps_0) == len(mu_0) == len(eps_90) == len(mu_90)):
+        raise ValueError("Anisotropic property vectors must have matching lengths.")
+
+    theta = math.radians(polarization_deg)
+    w0 = math.cos(theta) ** 2
+    w90 = math.sin(theta) ** 2
+    if NUMPY_AVAILABLE:
+        eps_eff = np.asarray(eps_0, dtype=complex) * w0 + np.asarray(eps_90, dtype=complex) * w90
+        mu_eff = np.asarray(mu_0, dtype=complex) * w0 + np.asarray(mu_90, dtype=complex) * w90
+        return eps_eff.tolist(), mu_eff.tolist()
+    eps_eff = [e0 * w0 + e90 * w90 for e0, e90 in zip(eps_0, eps_90)]
+    mu_eff = [m0 * w0 + m90 * w90 for m0, m90 in zip(mu_0, mu_90)]
+    return eps_eff, mu_eff
+
+
+def build_uncertainty_scales(cfg: UncertaintyConfig) -> list[tuple[float, float, float]]:
+    if not cfg.enabled:
+        return [(1.0, 1.0, 1.0)]
+
+    dt = cfg.thickness_pct / 100.0
+    de = cfg.eps_pct / 100.0
+    dm = cfg.mu_pct / 100.0
+    if dt < 0 or de < 0 or dm < 0:
+        raise ValueError("Uncertainty percentages must be >= 0.")
+
+    t_vals = [1.0 - dt, 1.0 + dt] if dt > 0 else [1.0]
+    e_vals = [1.0 - de, 1.0 + de] if de > 0 else [1.0]
+    m_vals = [1.0 - dm, 1.0 + dm] if dm > 0 else [1.0]
+
+    scales = sorted(set(product(t_vals, e_vals, m_vals)))
+    if (1.0, 1.0, 1.0) not in scales:
+        scales.append((1.0, 1.0, 1.0))
+    return scales
+
+
+def layer_properties(layer: LoadedLayer, f_ghz: float) -> tuple[complex, complex]:
+    eps_0 = interp_complex(f_ghz, layer.table_0deg.freq_ghz, layer.table_0deg.eps_r)
+    mu_0 = interp_complex(f_ghz, layer.table_0deg.freq_ghz, layer.table_0deg.mu_r)
+    if not layer.anisotropic:
+        return eps_0, mu_0
+
+    assert layer.table_90deg is not None
+    eps_90 = interp_complex(f_ghz, layer.table_90deg.freq_ghz, layer.table_90deg.eps_r)
+    mu_90 = interp_complex(f_ghz, layer.table_90deg.freq_ghz, layer.table_90deg.mu_r)
+    return mix_anisotropic(eps_0, mu_0, eps_90, mu_90, layer.polarization_deg)
+
+
+def layer_properties_many(layer: LoadedLayer, f_ghz: list[float]) -> tuple[list[complex], list[complex]]:
+    eps_0 = interp_complex_many(f_ghz, layer.table_0deg.freq_ghz, layer.table_0deg.eps_r)
+    mu_0 = interp_complex_many(f_ghz, layer.table_0deg.freq_ghz, layer.table_0deg.mu_r)
+    if not layer.anisotropic:
+        return eps_0, mu_0
+
+    assert layer.table_90deg is not None
+    eps_90 = interp_complex_many(f_ghz, layer.table_90deg.freq_ghz, layer.table_90deg.eps_r)
+    mu_90 = interp_complex_many(f_ghz, layer.table_90deg.freq_ghz, layer.table_90deg.mu_r)
+    return mix_anisotropic_many(eps_0, mu_0, eps_90, mu_90, layer.polarization_deg)
+
+
+def compute_stack_impedance(
+    f_ghz: float,
+    layers: list[LoadedLayer],
+    backing: str,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> complex:
+    if backing == "pec":
+        z_load = 0.0 + 0.0j
+    elif backing == "air":
+        z_load = ETA0 + 0.0j
+    else:
+        raise ValueError(f"Unsupported backing: {backing}")
+
+    f_hz = f_ghz * GHZ_TO_HZ
+    omega = 2.0 * math.pi * f_hz
+    k0 = omega / C0
+
+    # Cascade from bottom layer to top layer.
+    z_next = z_load
+    for layer in reversed(layers):
+        eps_r, mu_r = layer_properties(layer, f_ghz)
+        eps_r *= eps_scale
+        mu_r *= mu_scale
+        zc = ETA0 * cmath.sqrt(mu_r / eps_r)
+        gamma = 1j * k0 * cmath.sqrt(mu_r * eps_r)
+        t = cmath.tanh(gamma * layer.thickness_m * thickness_scale)
+        z_next = zc * (z_next + zc * t) / (zc + z_next * t)
+
+    return z_next
+
+
+def compute_stack_impedance_many(
+    f_ghz: list[float],
+    layers: list[LoadedLayer],
+    backing: str,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> list[complex]:
+    if backing == "pec":
+        z_load = 0.0 + 0.0j
+    elif backing == "air":
+        z_load = ETA0 + 0.0j
+    else:
+        raise ValueError(f"Unsupported backing: {backing}")
+
+    if not f_ghz:
+        return []
+
+    if NUMPY_AVAILABLE:
+        f_arr_ghz = np.asarray(f_ghz, dtype=float)
+        f_hz = f_arr_ghz * GHZ_TO_HZ
+        k0 = (2.0 * math.pi * f_hz) / C0
+        z_next = np.full_like(f_hz, z_load, dtype=complex)
+
+        for layer in reversed(layers):
+            eps_r, mu_r = layer_properties_many(layer, f_ghz)
+            eps_arr = np.asarray(eps_r, dtype=complex) * eps_scale
+            mu_arr = np.asarray(mu_r, dtype=complex) * mu_scale
+            zc = ETA0 * np.sqrt(mu_arr / eps_arr)
+            gamma = 1j * k0 * np.sqrt(mu_arr * eps_arr)
+            t = np.tanh(gamma * layer.thickness_m * thickness_scale)
+            z_next = zc * (z_next + zc * t) / (zc + z_next * t)
+        return z_next.tolist()
+
+    return [
+        compute_stack_impedance(
+            f,
+            layers,
+            backing,
+            thickness_scale=thickness_scale,
+            eps_scale=eps_scale,
+            mu_scale=mu_scale,
+        )
+        for f in f_ghz
+    ]
+
+
+def normalize_wave_polarization(pol: str) -> str:
+    p = pol.strip().lower()
+    if p in {"hh", "te", "hh (te)"}:
+        return "te"
+    if p in {"vv", "tm", "vv (tm)"}:
+        return "tm"
+    raise ValueError(f"Unsupported wave polarization: {pol}")
+
+
+def _stable_kz(z: complex) -> complex:
+    # Choose branch with non-negative attenuation.
+    if z.imag < 0:
+        return -z
+    if abs(z.imag) < 1e-12 and z.real < 0:
+        return -z
+    return z
+
+
+def layer_wave_params(
+    f_hz: float,
+    theta_deg: float,
+    eps_r: complex,
+    mu_r: complex,
+    wave_pol: str,
+) -> tuple[complex, complex]:
+    theta = math.radians(theta_deg)
+    k0 = 2.0 * math.pi * f_hz / C0
+    kx = k0 * math.sin(theta)
+    k_layer = k0 * cmath.sqrt(eps_r * mu_r)
+    kz = _stable_kz(cmath.sqrt(k_layer * k_layer - kx * kx))
+    omega = 2.0 * math.pi * f_hz
+    if wave_pol == "te":
+        zc = omega * MU0 * mu_r / kz
+    elif wave_pol == "tm":
+        zc = kz / (omega * EPS0 * eps_r)
+    else:
+        raise ValueError(f"Unsupported wave polarization: {wave_pol}")
+    return zc, kz
+
+
+def ambient_wave_impedance(theta_deg: float, wave_pol: str) -> complex:
+    theta = math.radians(theta_deg)
+    c = math.cos(theta)
+    if abs(c) < 1e-9:
+        c = 1e-9
+    if wave_pol == "te":
+        return ETA0 / c
+    if wave_pol == "tm":
+        return ETA0 * c
+    raise ValueError(f"Unsupported wave polarization: {wave_pol}")
+
+
+def cascade_input_impedance(
+    f_ghz: float,
+    theta_deg: float,
+    layers: list[LoadedLayer],
+    wave_pol: str,
+    z_load: complex,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> complex:
+    f_hz = f_ghz * GHZ_TO_HZ
+    z_next = z_load
+    for layer in reversed(layers):
+        eps_r, mu_r = layer_properties(layer, f_ghz)
+        eps_r *= eps_scale
+        mu_r *= mu_scale
+        zc, kz = layer_wave_params(f_hz, theta_deg, eps_r, mu_r, wave_pol)
+        t = cmath.tan(kz * layer.thickness_m * thickness_scale)
+        z_next = zc * (z_next + 1j * zc * t) / (zc + 1j * z_next * t)
+    return z_next
+
+
+def cascade_abcd(
+    f_ghz: float,
+    theta_deg: float,
+    layers: list[LoadedLayer],
+    wave_pol: str,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> tuple[complex, complex, complex, complex]:
+    f_hz = f_ghz * GHZ_TO_HZ
+    a = 1.0 + 0.0j
+    b = 0.0 + 0.0j
+    c = 0.0 + 0.0j
+    d = 1.0 + 0.0j
+
+    for layer in layers:
+        eps_r, mu_r = layer_properties(layer, f_ghz)
+        eps_r *= eps_scale
+        mu_r *= mu_scale
+        zc, kz = layer_wave_params(f_hz, theta_deg, eps_r, mu_r, wave_pol)
+        p = kz * layer.thickness_m * thickness_scale
+        ai = cmath.cos(p)
+        bi = 1j * zc * cmath.sin(p)
+        ci = 1j * cmath.sin(p) / zc
+        di = ai
+        a, b, c, d = (
+            a * ai + b * ci,
+            a * bi + b * di,
+            c * ai + d * ci,
+            c * bi + d * di,
+        )
+
+    return a, b, c, d
+
+
+def _db_from_mag(x: complex) -> float:
+    mag = max(abs(x), 1e-15)
+    return -20.0 * math.log10(mag)
+
+
+def _stable_kz_many(z: "np.ndarray") -> "np.ndarray":
+    out = np.asarray(z, dtype=complex)
+    mask = (out.imag < 0.0) | ((np.abs(out.imag) < 1e-12) & (out.real < 0.0))
+    return np.where(mask, -out, out)
+
+
+def _db_from_mag_many(x: "np.ndarray") -> "np.ndarray":
+    return -20.0 * np.log10(np.maximum(np.abs(x), 1e-15))
+
+
+def compute_angle_metrics_many(
+    f_ghz: list[float],
+    theta_deg: float,
+    layers: list[LoadedLayer],
+    wave_pol: str,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> dict[str, list[float]]:
+    if not f_ghz:
+        return {
+            "metal_loss_db": [],
+            "metal_phase_deg": [],
+            "air_loss_db": [],
+            "air_phase_deg": [],
+            "insertion_loss_db": [],
+            "insertion_phase_deg": [],
+        }
+
+    if not NUMPY_AVAILABLE:
+        rows = [
+            compute_angle_metrics(
+                f,
+                theta_deg,
+                layers,
+                wave_pol,
+                thickness_scale=thickness_scale,
+                eps_scale=eps_scale,
+                mu_scale=mu_scale,
+            )
+            for f in f_ghz
+        ]
+        return {
+            "metal_loss_db": [r["metal_loss_db"] for r in rows],
+            "metal_phase_deg": [r["metal_phase_deg"] for r in rows],
+            "air_loss_db": [r["air_loss_db"] for r in rows],
+            "air_phase_deg": [r["air_phase_deg"] for r in rows],
+            "insertion_loss_db": [r["insertion_loss_db"] for r in rows],
+            "insertion_phase_deg": [r["insertion_phase_deg"] for r in rows],
+        }
+
+    theta = math.radians(theta_deg)
+    sin_t = math.sin(theta)
+    z0 = ambient_wave_impedance(theta_deg, wave_pol)
+    f_arr_ghz = np.asarray(f_ghz, dtype=float)
+    f_hz = f_arr_ghz * GHZ_TO_HZ
+    omega = 2.0 * math.pi * f_hz
+    k0 = omega / C0
+    kx = k0 * sin_t
+
+    def _cascade(z_load: complex) -> np.ndarray:
+        z_next = np.full_like(f_hz, z_load, dtype=complex)
+        for layer in reversed(layers):
+            eps_r, mu_r = layer_properties_many(layer, f_ghz)
+            eps_arr = np.asarray(eps_r, dtype=complex) * eps_scale
+            mu_arr = np.asarray(mu_r, dtype=complex) * mu_scale
+            k_layer = k0 * np.sqrt(eps_arr * mu_arr)
+            kz = _stable_kz_many(np.sqrt(k_layer * k_layer - kx * kx))
+            if wave_pol == "te":
+                zc = omega * MU0 * mu_arr / kz
+            elif wave_pol == "tm":
+                zc = kz / (omega * EPS0 * eps_arr)
+            else:
+                raise ValueError(f"Unsupported wave polarization: {wave_pol}")
+            t = np.tan(kz * layer.thickness_m * thickness_scale)
+            z_next = zc * (z_next + 1j * zc * t) / (zc + 1j * z_next * t)
+        return z_next
+
+    zin_metal = _cascade(0.0 + 0.0j)
+    gamma_metal = (zin_metal - z0) / (zin_metal + z0)
+
+    zin_air = _cascade(z0)
+    gamma_air = (zin_air - z0) / (zin_air + z0)
+
+    a = np.ones_like(f_hz, dtype=complex)
+    b = np.zeros_like(f_hz, dtype=complex)
+    c = np.zeros_like(f_hz, dtype=complex)
+    d = np.ones_like(f_hz, dtype=complex)
+
+    for layer in layers:
+        eps_r, mu_r = layer_properties_many(layer, f_ghz)
+        eps_arr = np.asarray(eps_r, dtype=complex) * eps_scale
+        mu_arr = np.asarray(mu_r, dtype=complex) * mu_scale
+        k_layer = k0 * np.sqrt(eps_arr * mu_arr)
+        kz = _stable_kz_many(np.sqrt(k_layer * k_layer - kx * kx))
+        if wave_pol == "te":
+            zc = omega * MU0 * mu_arr / kz
+        elif wave_pol == "tm":
+            zc = kz / (omega * EPS0 * eps_arr)
+        else:
+            raise ValueError(f"Unsupported wave polarization: {wave_pol}")
+        p = kz * layer.thickness_m * thickness_scale
+        ai = np.cos(p)
+        si = np.sin(p)
+        bi = 1j * zc * si
+        ci = 1j * si / zc
+        di = ai
+        a, b, c, d = (
+            a * ai + b * ci,
+            a * bi + b * di,
+            c * ai + d * ci,
+            c * bi + d * di,
+        )
+
+    den = a + b / z0 + c * z0 + d
+    s21 = 2.0 / den
+
+    return {
+        "metal_loss_db": _db_from_mag_many(gamma_metal).tolist(),
+        "metal_phase_deg": np.degrees(np.angle(gamma_metal)).tolist(),
+        "air_loss_db": _db_from_mag_many(gamma_air).tolist(),
+        "air_phase_deg": np.degrees(np.angle(gamma_air)).tolist(),
+        "insertion_loss_db": _db_from_mag_many(s21).tolist(),
+        "insertion_phase_deg": np.degrees(np.angle(s21)).tolist(),
+    }
+
+
+def compute_angle_metrics(
+    f_ghz: float,
+    theta_deg: float,
+    layers: list[LoadedLayer],
+    wave_pol: str,
+    thickness_scale: float = 1.0,
+    eps_scale: float = 1.0,
+    mu_scale: float = 1.0,
+) -> dict[str, float]:
+    z0 = ambient_wave_impedance(theta_deg, wave_pol)
+
+    # Metal-backed reflection.
+    zin_metal = cascade_input_impedance(
+        f_ghz,
+        theta_deg,
+        layers,
+        wave_pol,
+        0.0 + 0.0j,
+        thickness_scale=thickness_scale,
+        eps_scale=eps_scale,
+        mu_scale=mu_scale,
+    )
+    gamma_metal = (zin_metal - z0) / (zin_metal + z0)
+
+    # Air-backed reflection.
+    zin_air = cascade_input_impedance(
+        f_ghz,
+        theta_deg,
+        layers,
+        wave_pol,
+        z0,
+        thickness_scale=thickness_scale,
+        eps_scale=eps_scale,
+        mu_scale=mu_scale,
+    )
+    gamma_air = (zin_air - z0) / (zin_air + z0)
+
+    # Through transmission in air (insertion).
+    a, b, c, d = cascade_abcd(
+        f_ghz,
+        theta_deg,
+        layers,
+        wave_pol,
+        thickness_scale=thickness_scale,
+        eps_scale=eps_scale,
+        mu_scale=mu_scale,
+    )
+    den = a + b / z0 + c * z0 + d
+    s21 = 2.0 / den
+
+    return {
+        "metal_loss_db": _db_from_mag(gamma_metal),
+        "metal_phase_deg": math.degrees(cmath.phase(gamma_metal)),
+        "air_loss_db": _db_from_mag(gamma_air),
+        "air_phase_deg": math.degrees(cmath.phase(gamma_air)),
+        "insertion_loss_db": _db_from_mag(s21),
+        "insertion_phase_deg": math.degrees(cmath.phase(s21)),
+    }
+
+
+def write_output(path: Path, rows: list[tuple[float, float, float]], include_header: bool) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        if include_header:
+            f.write("frequency_GHz z_r z_i\n")
+        for freq_ghz, zr, zi in rows:
+            f.write(f"{freq_ghz:.12g} {zr:.12g} {zi:.12g}\n")
+
+
+class LayerDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, initial: LayerConfig | None = None) -> None:
+        super().__init__(parent)
+        self.title("Layer")
+        self.resizable(False, False)
+        self.result: LayerConfig | None = None
+        self.transient(parent)
+        self.grab_set()
+
+        init = initial or LayerConfig(
+            thickness_in=0.125,
+            anisotropic=False,
+            file_0deg="material.txt",
+            file_90deg="",
+            polarization_deg=0.0,
+        )
+
+        self.thickness_var = tk.StringVar(value=str(init.thickness_in))
+        self.aniso_var = tk.BooleanVar(value=init.anisotropic)
+        self.file_0deg_var = tk.StringVar(value=init.file_0deg)
+        self.file_90deg_var = tk.StringVar(value=init.file_90deg)
+        self.pol_var = tk.StringVar(value=str(init.polarization_deg))
+
+        frm = ttk.Frame(self, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(frm, text="Thickness (in)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.thickness_var, width=14).grid(row=0, column=1, sticky="ew")
+
+        ttk.Checkbutton(
+            frm,
+            text="Anisotropic layer (0 deg / 90 deg files)",
+            variable=self.aniso_var,
+            command=self._sync_state,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        ttk.Label(frm, text="File (0 deg / isotropic)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frm, textvariable=self.file_0deg_var, width=42).grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        ttk.Button(frm, text="Browse", command=self._browse_0deg).grid(row=2, column=2, padx=(6, 0), pady=(8, 0))
+
+        self.lbl_90 = ttk.Label(frm, text="File (90 deg)")
+        self.lbl_90.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.ent_90 = ttk.Entry(frm, textvariable=self.file_90deg_var, width=42)
+        self.ent_90.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self.btn_90 = ttk.Button(frm, text="Browse", command=self._browse_90deg)
+        self.btn_90.grid(row=3, column=2, padx=(6, 0), pady=(8, 0))
+
+        self.lbl_pol = ttk.Label(frm, text="Polarization (deg)")
+        self.lbl_pol.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.ent_pol = ttk.Entry(frm, textvariable=self.pol_var, width=14)
+        self.ent_pol.grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btns, text="OK", command=self._on_ok).grid(row=0, column=1)
+
+        frm.columnconfigure(1, weight=1)
+        self._sync_state()
+        self.bind("<Return>", lambda _e: self._on_ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _sync_state(self) -> None:
+        state = "normal" if self.aniso_var.get() else "disabled"
+        self.lbl_90.configure(state=state)
+        self.ent_90.configure(state=state)
+        self.btn_90.configure(state=state)
+        self.lbl_pol.configure(state=state)
+        self.ent_pol.configure(state=state)
+
+    def _browse_0deg(self) -> None:
+        p = filedialog.askopenfilename(title="Select 0 deg/isotropic property file")
+        if p:
+            self.file_0deg_var.set(p)
+
+    def _browse_90deg(self) -> None:
+        p = filedialog.askopenfilename(title="Select 90 deg property file")
+        if p:
+            self.file_90deg_var.set(p)
+
+    def _on_ok(self) -> None:
+        try:
+            thickness_in = float(self.thickness_var.get().strip())
+            if thickness_in <= 0:
+                raise ValueError("Thickness must be > 0.")
+            anisotropic = self.aniso_var.get()
+            file_0deg = self.file_0deg_var.get().strip()
+            file_90deg = self.file_90deg_var.get().strip()
+            polarization_deg = float(self.pol_var.get().strip()) if anisotropic else 0.0
+
+            if not file_0deg:
+                raise ValueError("0 deg/isotropic file is required.")
+            if anisotropic and not file_90deg:
+                raise ValueError("90 deg file is required for anisotropic layer.")
+
+            self.result = LayerConfig(
+                thickness_in=thickness_in,
+                anisotropic=anisotropic,
+                file_0deg=file_0deg,
+                file_90deg=file_90deg,
+                polarization_deg=polarization_deg,
+            )
+            self.destroy()
+        except Exception as exc:
+            messagebox.showerror("Invalid Layer", str(exc), parent=self)
+
+
+class ImpedanceGui(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1020x620")
+        self.minsize(900, 560)
+
+        self.layers: list[LayerConfig] = []
+
+        self.f_start_var = tk.StringVar(value="1.0")
+        self.f_stop_var = tk.StringVar(value="18.0")
+        self.f_step_var = tk.StringVar(value="0.1")
+        self.backing_var = tk.StringVar(value="air")
+        self.skiprows_var = tk.StringVar(value="0")
+        self.output_var = tk.StringVar(value="impedance_out.txt")
+        self.header_var = tk.BooleanVar(value=True)
+        self.angle_mode_var = tk.BooleanVar(value=False)
+        self.angle_start_var = tk.StringVar(value="0.0")
+        self.angle_stop_var = tk.StringVar(value="80.0")
+        self.angle_step_var = tk.StringVar(value="1.0")
+        self.wave_pol_var = tk.StringVar(value="HH")
+        self.uncertainty_var = tk.BooleanVar(value=False)
+        self.unc_t_pct_var = tk.StringVar(value="5.0")
+        self.unc_eps_pct_var = tk.StringVar(value="5.0")
+        self.unc_mu_pct_var = tk.StringVar(value="5.0")
+        self.heatmap_metric_var = tk.StringVar(value=HEATMAP_METRIC_OPTIONS[0][0])
+        self.uncertainty_view_var = tk.StringVar(value=UNCERTAINTY_VIEW_OPTIONS[0][0])
+        self.metric_label_to_key = {label: key for label, key in HEATMAP_METRIC_OPTIONS}
+        self.metric_key_to_label = {key: label for label, key in HEATMAP_METRIC_OPTIONS}
+        self.uncertainty_view_label_to_key = {label: key for label, key in UNCERTAINTY_VIEW_OPTIONS}
+        self.cbar_auto_var = tk.BooleanVar(value=True)
+        self.cbar_min_var = tk.StringVar(value="")
+        self.cbar_max_var = tk.StringVar(value="")
+        self.opt_target_start_var = tk.StringVar(value="8.0")
+        self.opt_target_stop_var = tk.StringVar(value="12.0")
+        self.opt_target_step_var = tk.StringVar(value="0.25")
+        self.opt_thick_min_var = tk.StringVar(value="0.03")
+        self.opt_thick_max_var = tk.StringVar(value="0.30")
+        self.opt_thick_steps_var = tk.StringVar(value="8")
+        self.opt_material_mode_var = tk.StringVar(value="Current layer files")
+        self.opt_max_evals_var = tk.StringVar(value="400")
+        self.inv_target_start_var = tk.StringVar(value="8.0")
+        self.inv_target_stop_var = tk.StringVar(value="12.0")
+        self.inv_target_step_var = tk.StringVar(value="0.25")
+        self.inv_angle_start_var = tk.StringVar(value="0.0")
+        self.inv_angle_stop_var = tk.StringVar(value="80.0")
+        self.inv_angle_step_var = tk.StringVar(value="5.0")
+        self.inv_wave_pol_var = tk.StringVar(value="HH")
+        self.inv_thick_min_var = tk.StringVar(value="0.03")
+        self.inv_thick_max_var = tk.StringVar(value="0.30")
+        self.inv_thick_steps_var = tk.StringVar(value="8")
+        self.inv_material_mode_var = tk.StringVar(value="Current layer files")
+        self.inv_max_evals_var = tk.StringVar(value="400")
+        self.inv_top_n_var = tk.StringVar(value="10")
+        self.inv_uncertainty_var = tk.BooleanVar(value=True)
+        self.inv_unc_t_pct_var = tk.StringVar(value="5.0")
+        self.inv_unc_eps_pct_var = tk.StringVar(value="5.0")
+        self.inv_unc_mu_pct_var = tk.StringVar(value="5.0")
+        self.inv_score_mode_var = tk.StringVar(value=INVERSE_SCORE_MODE_OPTIONS[0])
+        self.dashboard_expand_var = tk.BooleanVar(value=False)
+        self.dashboard_expand_btn_var = tk.StringVar(value="Expand")
+        self.inverse_candidates: list[InverseCandidate] = []
+
+        # Plot objects are created in _build_ui(). Initialize here so early callbacks are safe.
+        self.fig = None
+        self.ax_heatmap = None
+        self.ax_freq_slice = None
+        self.ax_angle_slice = None
+        self.canvas = None
+        self.heatmap_cbar = None
+        self.heatmap_click_cid = None
+        self.selected_angle_idx: int | None = None
+        self.selected_freq_idx: int | None = None
+        self.inv_results_list: tk.Listbox | None = None
+        self.inv_unc_t_entry = None
+        self.inv_unc_eps_entry = None
+        self.inv_unc_mu_entry = None
+
+        self.last_heatmap_results: dict[str, list[list[float]] | list[float]] | None = None
+        self.last_heatmap_uncertainty_min: dict[str, list[list[float]]] | None = None
+        self.last_heatmap_uncertainty_max: dict[str, list[list[float]]] | None = None
+
+        self._build_ui()
+        if Path("material.txt").exists():
+            self.layers.append(
+                LayerConfig(
+                    thickness_in=0.125,
+                    anisotropic=False,
+                    file_0deg="material.txt",
+                    file_90deg="",
+                    polarization_deg=0.0,
+                )
+            )
+            self._refresh_layers()
+
+    def _build_ui(self) -> None:
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        split = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
+        split.grid(row=0, column=0, sticky="nsew")
+
+        left = ttk.Frame(split, padding=4)
+        right = ttk.Frame(split, padding=4)
+        split.add(left, weight=4)
+        split.add(right, weight=3)
+
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(3, weight=1)
+
+        io_frame = ttk.LabelFrame(left, text="Output")
+        io_frame.grid(row=0, column=0, sticky="ew")
+        io_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(io_frame, text="Output file").grid(row=0, column=0, padx=(8, 4), pady=8)
+        ttk.Entry(io_frame, textvariable=self.output_var).grid(row=0, column=1, sticky="ew", pady=8)
+        ttk.Button(io_frame, text="Browse", command=self._browse_output).grid(
+            row=0, column=2, padx=(6, 8), pady=8
+        )
+
+        ttk.Label(io_frame, text="Skip rows").grid(row=0, column=3, padx=(10, 4), pady=8)
+        ttk.Entry(io_frame, textvariable=self.skiprows_var, width=6).grid(row=0, column=4, pady=8)
+        ttk.Checkbutton(io_frame, text="Write header", variable=self.header_var).grid(
+            row=0, column=5, padx=(10, 8), pady=8
+        )
+
+        settings = ttk.LabelFrame(left, text="Frequency Sweep (GHz)")
+        settings.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        settings.columnconfigure(7, weight=1)
+
+        ttk.Label(settings, text="Start").grid(row=0, column=0, padx=(8, 4), pady=8)
+        ttk.Entry(settings, textvariable=self.f_start_var, width=10).grid(row=0, column=1, pady=8)
+        ttk.Label(settings, text="Stop").grid(row=0, column=2, padx=(10, 4), pady=8)
+        ttk.Entry(settings, textvariable=self.f_stop_var, width=10).grid(row=0, column=3, pady=8)
+        ttk.Label(settings, text="Step").grid(row=0, column=4, padx=(10, 4), pady=8)
+        ttk.Entry(settings, textvariable=self.f_step_var, width=10).grid(row=0, column=5, pady=8)
+        self.backing_label = ttk.Label(settings, text="Backing")
+        self.backing_label.grid(row=0, column=6, padx=(10, 4), pady=8)
+        self.backing_combo = ttk.Combobox(
+            settings,
+            textvariable=self.backing_var,
+            values=("pec", "air", "free-space"),
+            state="readonly",
+            width=12,
+        )
+        self.backing_combo.grid(row=0, column=7, sticky="w", pady=8)
+
+        tabs = ttk.Notebook(left)
+        tabs.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+        angle_tab = ttk.Frame(tabs, padding=8)
+        angle_tab.columnconfigure(7, weight=1)
+        tabs.add(angle_tab, text="Angle Analysis")
+        ttk.Checkbutton(
+            angle_tab,
+            text="Enable angle-frequency heatmap mode",
+            variable=self.angle_mode_var,
+            command=self._sync_mode_state,
+        ).grid(row=0, column=0, columnspan=8, sticky="w", pady=(0, 6))
+        ttk.Label(angle_tab, text="Angle start").grid(row=1, column=0, padx=(0, 4), pady=6)
+        ttk.Entry(angle_tab, textvariable=self.angle_start_var, width=10).grid(row=1, column=1, pady=6)
+        ttk.Label(angle_tab, text="Angle stop").grid(row=1, column=2, padx=(10, 4), pady=6)
+        ttk.Entry(angle_tab, textvariable=self.angle_stop_var, width=10).grid(row=1, column=3, pady=6)
+        ttk.Label(angle_tab, text="Angle step").grid(row=1, column=4, padx=(10, 4), pady=6)
+        ttk.Entry(angle_tab, textvariable=self.angle_step_var, width=10).grid(row=1, column=5, pady=6)
+        ttk.Label(angle_tab, text="Wave pol").grid(row=1, column=6, padx=(10, 4), pady=6)
+        ttk.Combobox(
+            angle_tab,
+            textvariable=self.wave_pol_var,
+            values=("HH", "VV"),
+            state="readonly",
+            width=8,
+        ).grid(row=1, column=7, sticky="w", pady=6)
+        ttk.Label(
+            angle_tab,
+            text="Heatmap uses Frequency Sweep as Y-axis and Angle Sweep as X-axis.",
+        ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(0, 2))
+
+        unc_tab = ttk.Frame(tabs, padding=8)
+        unc_tab.columnconfigure(0, weight=1)
+        tabs.add(unc_tab, text="Uncertainty")
+        ttk.Checkbutton(
+            unc_tab,
+            text="Enable uncertainty envelope (corner sweep)",
+            variable=self.uncertainty_var,
+            command=self._sync_uncertainty_state,
+        ).grid(row=0, column=0, sticky="w")
+        self.unc_details_frame = ttk.Frame(unc_tab)
+        self.unc_details_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.unc_details_frame.columnconfigure(7, weight=1)
+        ttk.Label(self.unc_details_frame, text="Thickness ±%").grid(row=0, column=0, padx=(0, 4), pady=4)
+        self.unc_t_entry = ttk.Entry(self.unc_details_frame, textvariable=self.unc_t_pct_var, width=10)
+        self.unc_t_entry.grid(row=0, column=1, pady=4)
+        ttk.Label(self.unc_details_frame, text="Eps ±%").grid(row=0, column=2, padx=(10, 4), pady=4)
+        self.unc_eps_entry = ttk.Entry(self.unc_details_frame, textvariable=self.unc_eps_pct_var, width=10)
+        self.unc_eps_entry.grid(row=0, column=3, pady=4)
+        ttk.Label(self.unc_details_frame, text="Mu ±%").grid(row=0, column=4, padx=(10, 4), pady=4)
+        self.unc_mu_entry = ttk.Entry(self.unc_details_frame, textvariable=self.unc_mu_pct_var, width=10)
+        self.unc_mu_entry.grid(row=0, column=5, pady=4)
+        ttk.Label(
+            self.unc_details_frame,
+            text="Writes nominal + min/max envelopes over ± perturbation corners.",
+        ).grid(row=0, column=6, columnspan=2, sticky="w", padx=(10, 0), pady=4)
+
+        opt_tab = ttk.Frame(tabs, padding=8)
+        opt_tab.columnconfigure(12, weight=1)
+        tabs.add(opt_tab, text="Optimization")
+        ttk.Label(opt_tab, text="Band start").grid(row=0, column=0, padx=(0, 4), pady=6)
+        ttk.Entry(opt_tab, textvariable=self.opt_target_start_var, width=8).grid(row=0, column=1, pady=6)
+        ttk.Label(opt_tab, text="Band stop").grid(row=0, column=2, padx=(8, 4), pady=6)
+        ttk.Entry(opt_tab, textvariable=self.opt_target_stop_var, width=8).grid(row=0, column=3, pady=6)
+        ttk.Label(opt_tab, text="Band step").grid(row=0, column=4, padx=(8, 4), pady=6)
+        ttk.Entry(opt_tab, textvariable=self.opt_target_step_var, width=8).grid(row=0, column=5, pady=6)
+        ttk.Label(opt_tab, text="t_min").grid(row=1, column=0, padx=(0, 4), pady=(2, 6))
+        ttk.Entry(opt_tab, textvariable=self.opt_thick_min_var, width=8).grid(row=1, column=1, pady=(2, 6))
+        ttk.Label(opt_tab, text="t_max").grid(row=1, column=2, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(opt_tab, textvariable=self.opt_thick_max_var, width=8).grid(row=1, column=3, pady=(2, 6))
+        ttk.Label(opt_tab, text="t_steps").grid(row=1, column=4, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(opt_tab, textvariable=self.opt_thick_steps_var, width=6).grid(row=1, column=5, pady=(2, 6), sticky="w")
+        ttk.Label(opt_tab, text="Material mode").grid(row=2, column=0, padx=(0, 4), pady=(2, 6))
+        ttk.Combobox(
+            opt_tab,
+            textvariable=self.opt_material_mode_var,
+            values=("Current layer files", "Search .txt materials in folder"),
+            state="readonly",
+            width=28,
+        ).grid(row=2, column=1, columnspan=4, sticky="w", pady=(2, 6))
+        ttk.Label(opt_tab, text="Max evals").grid(row=2, column=5, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(opt_tab, textvariable=self.opt_max_evals_var, width=8).grid(row=2, column=6, pady=(2, 6))
+        ttk.Label(
+            opt_tab,
+            text="Objective: maximize average metal-backed loss (dB) over target band at 0 deg.",
+        ).grid(row=3, column=0, columnspan=13, sticky="w", pady=(2, 6))
+        ttk.Button(opt_tab, text="Run Optimize", command=self._optimize).grid(
+            row=4, column=0, columnspan=13, sticky="w", pady=(6, 0)
+        )
+
+        inv_tab = ttk.Frame(tabs, padding=8)
+        inv_tab.columnconfigure(7, weight=1)
+        inv_tab.rowconfigure(6, weight=1)
+        tabs.add(inv_tab, text="Inverse Design")
+        ttk.Label(inv_tab, text="Band start").grid(row=0, column=0, padx=(0, 4), pady=6)
+        ttk.Entry(inv_tab, textvariable=self.inv_target_start_var, width=8).grid(row=0, column=1, pady=6)
+        ttk.Label(inv_tab, text="Band stop").grid(row=0, column=2, padx=(8, 4), pady=6)
+        ttk.Entry(inv_tab, textvariable=self.inv_target_stop_var, width=8).grid(row=0, column=3, pady=6)
+        ttk.Label(inv_tab, text="Band step").grid(row=0, column=4, padx=(8, 4), pady=6)
+        ttk.Entry(inv_tab, textvariable=self.inv_target_step_var, width=8).grid(row=0, column=5, pady=6)
+
+        ttk.Label(inv_tab, text="Angle start").grid(row=1, column=0, padx=(0, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_angle_start_var, width=8).grid(row=1, column=1, pady=(2, 6))
+        ttk.Label(inv_tab, text="Angle stop").grid(row=1, column=2, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_angle_stop_var, width=8).grid(row=1, column=3, pady=(2, 6))
+        ttk.Label(inv_tab, text="Angle step").grid(row=1, column=4, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_angle_step_var, width=8).grid(row=1, column=5, pady=(2, 6))
+        ttk.Label(inv_tab, text="Wave pol").grid(row=1, column=6, padx=(8, 4), pady=(2, 6))
+        ttk.Combobox(
+            inv_tab,
+            textvariable=self.inv_wave_pol_var,
+            values=("HH", "VV"),
+            state="readonly",
+            width=8,
+        ).grid(row=1, column=7, sticky="w", pady=(2, 6))
+
+        ttk.Label(inv_tab, text="t_min").grid(row=2, column=0, padx=(0, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_thick_min_var, width=8).grid(row=2, column=1, pady=(2, 6))
+        ttk.Label(inv_tab, text="t_max").grid(row=2, column=2, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_thick_max_var, width=8).grid(row=2, column=3, pady=(2, 6))
+        ttk.Label(inv_tab, text="t_steps").grid(row=2, column=4, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_thick_steps_var, width=8).grid(row=2, column=5, pady=(2, 6))
+
+        ttk.Label(inv_tab, text="Material mode").grid(row=3, column=0, padx=(0, 4), pady=(2, 6))
+        ttk.Combobox(
+            inv_tab,
+            textvariable=self.inv_material_mode_var,
+            values=("Current layer files", "Search .txt materials in folder"),
+            state="readonly",
+            width=28,
+        ).grid(row=3, column=1, columnspan=3, sticky="w", pady=(2, 6))
+        ttk.Label(inv_tab, text="Max evals").grid(row=3, column=4, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_max_evals_var, width=8).grid(row=3, column=5, pady=(2, 6))
+        ttk.Label(inv_tab, text="Top N").grid(row=3, column=6, padx=(8, 4), pady=(2, 6))
+        ttk.Entry(inv_tab, textvariable=self.inv_top_n_var, width=8).grid(row=3, column=7, pady=(2, 6), sticky="w")
+
+        ttk.Checkbutton(
+            inv_tab,
+            text="Enable robust scoring (uncertainty corners)",
+            variable=self.inv_uncertainty_var,
+            command=self._sync_inverse_uncertainty_state,
+        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        ttk.Label(inv_tab, text="T ±%").grid(row=4, column=4, padx=(4, 4), pady=(2, 6))
+        self.inv_unc_t_entry = ttk.Entry(inv_tab, textvariable=self.inv_unc_t_pct_var, width=7)
+        self.inv_unc_t_entry.grid(row=4, column=5, pady=(2, 6), sticky="w")
+        ttk.Label(inv_tab, text="Eps ±%").grid(row=4, column=6, padx=(4, 4), pady=(2, 6))
+        self.inv_unc_eps_entry = ttk.Entry(inv_tab, textvariable=self.inv_unc_eps_pct_var, width=7)
+        self.inv_unc_eps_entry.grid(row=4, column=7, pady=(2, 6), sticky="w")
+        ttk.Label(inv_tab, text="Mu ±%").grid(row=5, column=0, padx=(0, 4), pady=(0, 6), sticky="w")
+        self.inv_unc_mu_entry = ttk.Entry(inv_tab, textvariable=self.inv_unc_mu_pct_var, width=7)
+        self.inv_unc_mu_entry.grid(row=5, column=1, pady=(0, 6), sticky="w")
+        ttk.Label(inv_tab, text="Score mode").grid(row=5, column=2, padx=(8, 4), pady=(0, 6))
+        ttk.Combobox(
+            inv_tab,
+            textvariable=self.inv_score_mode_var,
+            values=INVERSE_SCORE_MODE_OPTIONS,
+            state="readonly",
+            width=34,
+        ).grid(row=5, column=3, columnspan=5, sticky="w", pady=(0, 6))
+
+        results_frame = ttk.Frame(inv_tab)
+        results_frame.grid(row=6, column=0, columnspan=8, sticky="nsew", pady=(2, 6))
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+        self.inv_results_list = tk.Listbox(results_frame, height=7, exportselection=False)
+        self.inv_results_list.grid(row=0, column=0, sticky="nsew")
+        inv_scroll = ttk.Scrollbar(results_frame, orient="vertical", command=self.inv_results_list.yview)
+        inv_scroll.grid(row=0, column=1, sticky="ns")
+        self.inv_results_list.configure(yscrollcommand=inv_scroll.set)
+
+        inv_actions = ttk.Frame(inv_tab)
+        inv_actions.grid(row=7, column=0, columnspan=8, sticky="w")
+        ttk.Button(inv_actions, text="Run Inverse Design", command=self._run_inverse_design).grid(row=0, column=0)
+        ttk.Button(inv_actions, text="Apply Selected", command=self._apply_inverse_candidate).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+
+        stats_tab = ttk.Frame(tabs, padding=8)
+        stats_tab.columnconfigure(0, weight=1)
+        tabs.add(stats_tab, text="Quick Stats")
+        dash_toolbar = ttk.Frame(stats_tab)
+        dash_toolbar.grid(row=0, column=0, sticky="e", pady=(0, 6))
+        ttk.Button(
+            dash_toolbar,
+            textvariable=self.dashboard_expand_btn_var,
+            command=self._toggle_dashboard_expand,
+            width=9,
+        ).grid(row=0, column=0)
+        self.dashboard_text = tk.Text(stats_tab, height=6, wrap="word")
+        self.dashboard_text.grid(row=1, column=0, sticky="ew")
+        self.dashboard_text.configure(state="disabled")
+
+        layers_frame = ttk.LabelFrame(left, text="Layers (top to bottom)")
+        layers_frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        layers_frame.columnconfigure(0, weight=1)
+        layers_frame.columnconfigure(2, weight=1)
+        layers_frame.rowconfigure(0, weight=1)
+
+        self.layer_list = tk.Listbox(layers_frame, height=12)
+        self.layer_list.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        scroll = ttk.Scrollbar(layers_frame, orient="vertical", command=self.layer_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns", pady=8)
+        self.layer_list.configure(yscrollcommand=scroll.set)
+
+        preview = ttk.Frame(layers_frame)
+        preview.grid(row=0, column=2, sticky="nsew", padx=8, pady=8)
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(1, weight=1)
+        ttk.Label(preview, text="Visual stack (real-time)").grid(row=0, column=0, sticky="w")
+        self.layer_preview = tk.Canvas(
+            preview,
+            width=250,
+            height=250,
+            highlightthickness=1,
+            highlightbackground="#b0b0b0",
+            bg="#f7f7f7",
+        )
+        self.layer_preview.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.layer_preview.bind("<Configure>", self._on_layer_preview_configure)
+
+        btns = ttk.Frame(layers_frame)
+        btns.grid(row=0, column=3, sticky="ns", padx=8, pady=8)
+        ttk.Button(btns, text="Add", width=12, command=self._add_layer).grid(row=0, column=0, pady=(0, 6))
+        ttk.Button(btns, text="Edit", width=12, command=self._edit_layer).grid(row=1, column=0, pady=6)
+        ttk.Button(btns, text="Remove", width=12, command=self._remove_layer).grid(row=2, column=0, pady=6)
+        ttk.Button(btns, text="Move Up", width=12, command=self._move_up).grid(row=3, column=0, pady=6)
+        ttk.Button(btns, text="Move Down", width=12, command=self._move_down).grid(row=4, column=0, pady=6)
+
+        action = ttk.Frame(left)
+        action.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(action, text="About", command=self._show_about).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(action, text="Compute", command=self._compute).grid(row=0, column=1)
+
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        plot_opts = ttk.LabelFrame(right, text="Heatmap Controls")
+        plot_opts.grid(row=0, column=0, sticky="ew")
+        plot_opts.columnconfigure(1, weight=1)
+        plot_opts.columnconfigure(3, weight=1)
+        ttk.Label(plot_opts, text="Metric").grid(row=0, column=0, padx=(8, 4), pady=8, sticky="w")
+        metric_combo = ttk.Combobox(
+            plot_opts,
+            textvariable=self.heatmap_metric_var,
+            values=[label for label, _key in HEATMAP_METRIC_OPTIONS],
+            state="readonly",
+        )
+        metric_combo.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="ew")
+        metric_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_plot())
+        ttk.Label(plot_opts, text="Uncertainty view").grid(row=0, column=2, padx=(0, 4), pady=8, sticky="w")
+        unc_view_combo = ttk.Combobox(
+            plot_opts,
+            textvariable=self.uncertainty_view_var,
+            values=[label for label, _key in UNCERTAINTY_VIEW_OPTIONS],
+            state="readonly",
+            width=14,
+        )
+        unc_view_combo.grid(row=0, column=3, padx=(0, 8), pady=8, sticky="ew")
+        unc_view_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_plot())
+        ttk.Button(plot_opts, text="Update Plot", command=self._update_plot).grid(
+            row=0, column=4, padx=(0, 8), pady=8
+        )
+
+        ttk.Checkbutton(
+            plot_opts,
+            text="Auto color scale",
+            variable=self.cbar_auto_var,
+            command=self._sync_cbar_state,
+        ).grid(row=1, column=0, padx=(8, 4), pady=8, sticky="w")
+        ttk.Label(plot_opts, text="Min").grid(row=1, column=1, padx=(0, 4), pady=8, sticky="e")
+        self.cbar_min_entry = ttk.Entry(plot_opts, textvariable=self.cbar_min_var, width=10)
+        self.cbar_min_entry.grid(row=1, column=2, padx=(0, 8), pady=8, sticky="w")
+        ttk.Label(plot_opts, text="Max").grid(row=1, column=3, padx=(0, 4), pady=8, sticky="e")
+        self.cbar_max_entry = ttk.Entry(plot_opts, textvariable=self.cbar_max_var, width=10)
+        self.cbar_max_entry.grid(row=1, column=4, padx=(0, 8), pady=8, sticky="w")
+        self.cbar_min_entry.bind("<Return>", lambda _e: self._update_plot())
+        self.cbar_max_entry.bind("<Return>", lambda _e: self._update_plot())
+        ttk.Button(plot_opts, text="Save Plot", command=self._save_plot).grid(
+            row=1, column=5, padx=(0, 8), pady=8
+        )
+        self._sync_cbar_state()
+
+        self.plot_frame = ttk.LabelFrame(right, text="Heatmap")
+        self.plot_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        self.plot_frame.columnconfigure(0, weight=1)
+        self.plot_frame.rowconfigure(0, weight=1)
+
+        if MPL_AVAILABLE:
+            self.fig = Figure(figsize=(6.8, 5.2), dpi=100)
+            gs = self.fig.add_gridspec(2, 2, height_ratios=[2.6, 1.5], hspace=0.42)
+            self.ax_heatmap = self.fig.add_subplot(gs[0, :])
+            self.ax_freq_slice = self.fig.add_subplot(gs[1, 0])
+            self.ax_angle_slice = self.fig.add_subplot(gs[1, 1])
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
+            self.heatmap_cbar = None
+            self.heatmap_click_cid = self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+            self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+            self._draw_plot_placeholder("Run heatmap mode to populate plot.")
+        else:
+            self.fig = None
+            self.ax_heatmap = None
+            self.ax_freq_slice = None
+            self.ax_angle_slice = None
+            self.canvas = None
+            self.heatmap_cbar = None
+            ttk.Label(
+                self.plot_frame,
+                text="Matplotlib not available. Install matplotlib to enable plotting.",
+            ).grid(row=0, column=0, padx=12, pady=12, sticky="nw")
+        self._set_dashboard_text("Run a compute to populate dashboard and interactive slices.")
+        self._sync_mode_state()
+        self._sync_uncertainty_state()
+        self._sync_inverse_uncertainty_state()
+        self._draw_layer_preview()
+
+    def _browse_output(self) -> None:
+        p = filedialog.asksaveasfilename(
+            title="Select output file",
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if p:
+            self.output_var.set(p)
+
+    def _sync_cbar_state(self) -> None:
+        state = "disabled" if self.cbar_auto_var.get() else "normal"
+        self.cbar_min_entry.configure(state=state)
+        self.cbar_max_entry.configure(state=state)
+        if self.canvas is not None:
+            self._update_plot()
+
+    def _sync_mode_state(self) -> None:
+        if self.angle_mode_var.get():
+            self.backing_combo.configure(state="disabled")
+            self.backing_label.state(["disabled"])
+            return
+        self.backing_combo.configure(state="readonly")
+        self.backing_label.state(["!disabled"])
+
+    def _sync_uncertainty_state(self) -> None:
+        if self.uncertainty_var.get():
+            self.unc_details_frame.grid()
+            self.unc_t_entry.configure(state="normal")
+            self.unc_eps_entry.configure(state="normal")
+            self.unc_mu_entry.configure(state="normal")
+            return
+        self.unc_details_frame.grid_remove()
+        self.unc_t_entry.configure(state="disabled")
+        self.unc_eps_entry.configure(state="disabled")
+        self.unc_mu_entry.configure(state="disabled")
+
+    def _sync_inverse_uncertainty_state(self) -> None:
+        state = "normal" if self.inv_uncertainty_var.get() else "disabled"
+        if self.inv_unc_t_entry is not None:
+            self.inv_unc_t_entry.configure(state=state)
+        if self.inv_unc_eps_entry is not None:
+            self.inv_unc_eps_entry.configure(state=state)
+        if self.inv_unc_mu_entry is not None:
+            self.inv_unc_mu_entry.configure(state=state)
+
+    def _toggle_dashboard_expand(self) -> None:
+        expanded = not self.dashboard_expand_var.get()
+        self.dashboard_expand_var.set(expanded)
+        self.dashboard_expand_btn_var.set("Collapse" if expanded else "Expand")
+        self.dashboard_text.configure(height=14 if expanded else 6)
+
+    def _read_uncertainty_config(self) -> UncertaintyConfig:
+        if not self.uncertainty_var.get():
+            return UncertaintyConfig(enabled=False, thickness_pct=0.0, eps_pct=0.0, mu_pct=0.0)
+
+        thickness_pct = float(self.unc_t_pct_var.get().strip())
+        eps_pct = float(self.unc_eps_pct_var.get().strip())
+        mu_pct = float(self.unc_mu_pct_var.get().strip())
+        if thickness_pct < 0 or eps_pct < 0 or mu_pct < 0:
+            raise ValueError("Uncertainty percentages must be >= 0.")
+        return UncertaintyConfig(
+            enabled=True,
+            thickness_pct=thickness_pct,
+            eps_pct=eps_pct,
+            mu_pct=mu_pct,
+        )
+
+    def _save_plot(self) -> None:
+        if not MPL_AVAILABLE or self.fig is None:
+            messagebox.showerror("Plot", "Matplotlib is not available.")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Save plot image",
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg;*.jpeg"), ("All Files", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            self.fig.savefig(p, dpi=300, bbox_inches="tight")
+            messagebox.showinfo("Plot", f"Saved plot to:\n{p}")
+        except Exception as exc:
+            messagebox.showerror("Plot", str(exc))
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(f"About {APP_ACRONYM}", ABOUT_TEXT)
+
+    def _get_color_limits(self) -> tuple[float | None, float | None]:
+        if self.cbar_auto_var.get():
+            return None, None
+        cmin_text = self.cbar_min_var.get().strip()
+        cmax_text = self.cbar_max_var.get().strip()
+        if not cmin_text or not cmax_text:
+            raise ValueError("Set both colorbar Min and Max, or enable Auto color scale.")
+        cmin = float(cmin_text)
+        cmax = float(cmax_text)
+        if cmax <= cmin:
+            raise ValueError("Colorbar Max must be greater than Min.")
+        return cmin, cmax
+
+    def _stats(self, values: list[float]) -> tuple[float, float, float]:
+        if not values:
+            return float("nan"), float("nan"), float("nan")
+        if NUMPY_AVAILABLE:
+            arr = np.asarray(values, dtype=float)
+            return float(arr.mean()), float(arr.min()), float(arr.max())
+        mean = sum(values) / len(values)
+        return mean, min(values), max(values)
+
+    def _max_contiguous_bandwidth(
+        self,
+        freqs: list[float],
+        values: list[float],
+        threshold: float,
+    ) -> float:
+        if len(freqs) < 2:
+            return 0.0
+        best = 0.0
+        run_start: int | None = None
+        for i, v in enumerate(values):
+            if v >= threshold:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                best = max(best, freqs[i - 1] - freqs[run_start])
+                run_start = None
+        if run_start is not None:
+            best = max(best, freqs[-1] - freqs[run_start])
+        return max(best, 0.0)
+
+    def _summarize_angle_run(
+        self,
+        out: dict[str, list[list[float]] | list[float]],
+        wave_pol: str,
+        uncertainty_enabled: bool,
+    ) -> str:
+        freqs = out["freq_ghz"]
+        angles = out["angle_deg"]
+        metal = out["metal_loss_db"]
+        air = out["air_loss_db"]
+        ins = out["insertion_loss_db"]
+        phase = out["metal_phase_deg"]
+
+        all_metal = [v for row in metal for v in row]
+        all_air = [v for row in air for v in row]
+        all_ins = [v for row in ins for v in row]
+        all_phase = [v for row in phase for v in row]
+        metal_mean, metal_min, metal_max = self._stats(all_metal)
+        air_mean, air_min, air_max = self._stats(all_air)
+        ins_mean, ins_min, ins_max = self._stats(all_ins)
+        phase_mean, phase_min, phase_max = self._stats(all_phase)
+
+        band_threshold = 10.0
+        best_bw = 0.0
+        best_bw_angle = angles[0]
+        for j, a in enumerate(angles):
+            row = [metal[i][j] for i in range(len(freqs))]
+            bw = self._max_contiguous_bandwidth(freqs, row, band_threshold)
+            if bw > best_bw:
+                best_bw = bw
+                best_bw_angle = a
+
+        best_angle = angles[0]
+        best_angle_score = float("-inf")
+        for j, a in enumerate(angles):
+            row = [metal[i][j] for i in range(len(freqs))]
+            score, _mn, _mx = self._stats(row)
+            if score > best_angle_score:
+                best_angle_score = score
+                best_angle = a
+
+        unc_state = "ON" if uncertainty_enabled else "OFF"
+        return (
+            f"Mode: angle-frequency heatmap ({wave_pol.upper()}) | Uncertainty: {unc_state}\n"
+            f"Grid: {len(freqs)} freq x {len(angles)} angle points\n"
+            f"Metal loss dB mean/min/max: {metal_mean:.3f} / {metal_min:.3f} / {metal_max:.3f}\n"
+            f"Air loss dB mean/min/max: {air_mean:.3f} / {air_min:.3f} / {air_max:.3f}\n"
+            f"Insertion loss dB mean/min/max: {ins_mean:.3f} / {ins_min:.3f} / {ins_max:.3f}\n"
+            f"Metal phase deg mean/min/max: {phase_mean:.3f} / {phase_min:.3f} / {phase_max:.3f}\n"
+            f"Best average metal loss angle: {best_angle:.2f} deg ({best_angle_score:.3f} dB)\n"
+            f"Max contiguous bandwidth with metal loss >= {band_threshold:.0f} dB: "
+            f"{best_bw:.3f} GHz @ {best_bw_angle:.2f} deg"
+        )
+
+    def _summarize_frequency_run(
+        self,
+        sweep: list[float],
+        loaded_layers: list[LoadedLayer],
+        wave_pol: str,
+        uncertainty_enabled: bool,
+        backing: str,
+    ) -> str:
+        metrics = compute_angle_metrics_many(sweep, 0.0, loaded_layers, wave_pol)
+        metal = metrics["metal_loss_db"]
+        air = metrics["air_loss_db"]
+        ins = metrics["insertion_loss_db"]
+        phase = metrics["metal_phase_deg"]
+        metal_mean, metal_min, metal_max = self._stats(metal)
+        air_mean, air_min, air_max = self._stats(air)
+        ins_mean, ins_min, ins_max = self._stats(ins)
+        phase_mean, phase_min, phase_max = self._stats(phase)
+        bw10 = self._max_contiguous_bandwidth(sweep, metal, 10.0)
+        unc_state = "ON" if uncertainty_enabled else "OFF"
+        return (
+            f"Mode: frequency sweep ({wave_pol.upper()}, backing={backing}) | Uncertainty: {unc_state}\n"
+            f"Points: {len(sweep)}\n"
+            f"Metal loss dB mean/min/max: {metal_mean:.3f} / {metal_min:.3f} / {metal_max:.3f}\n"
+            f"Air loss dB mean/min/max: {air_mean:.3f} / {air_min:.3f} / {air_max:.3f}\n"
+            f"Insertion loss dB mean/min/max: {ins_mean:.3f} / {ins_min:.3f} / {ins_max:.3f}\n"
+            f"Metal phase deg mean/min/max: {phase_mean:.3f} / {phase_min:.3f} / {phase_max:.3f}\n"
+            f"Contiguous bandwidth with metal loss >= 10 dB at 0 deg: {bw10:.3f} GHz"
+        )
+
+    def _selected_idx(self) -> int | None:
+        sel = self.layer_list.curselection()
+        if not sel:
+            return None
+        return int(sel[0])
+
+    def _on_layer_preview_configure(self, _event: tk.Event) -> None:
+        self._draw_layer_preview()
+
+    def _draw_layer_preview(self) -> None:
+        self.layer_preview.delete("all")
+
+        width = max(self.layer_preview.winfo_width(), int(self.layer_preview.cget("width")))
+        height = max(self.layer_preview.winfo_height(), int(self.layer_preview.cget("height")))
+        if width < 40 or height < 40:
+            return
+
+        if not self.layers:
+            self.layer_preview.create_text(
+                width / 2.0,
+                height / 2.0,
+                text="No layers configured",
+                fill="#5a5a5a",
+            )
+            return
+
+        pad = 12.0
+        title_gap = 18.0
+        x0 = pad
+        x1 = width - pad
+        y0 = pad + title_gap
+        y1 = height - pad - title_gap
+        if y1 <= y0:
+            return
+
+        self.layer_preview.create_text(
+            (x0 + x1) * 0.5,
+            pad,
+            text="Top (incident side)",
+            anchor="n",
+            fill="#404040",
+        )
+        self.layer_preview.create_text(
+            (x0 + x1) * 0.5,
+            height - pad,
+            text="Bottom / backing",
+            anchor="s",
+            fill="#404040",
+        )
+
+        thicknesses = [max(layer.thickness_in, 0.0) for layer in self.layers]
+        n = len(self.layers)
+        stack_h = y1 - y0
+        min_h = min(22.0, stack_h / max(float(n), 1.0))
+        min_total = min_h * n
+
+        if stack_h <= min_total or sum(thicknesses) <= 0:
+            heights = [stack_h / n] * n
+        else:
+            extra_h = stack_h - min_total
+            total_t = sum(thicknesses)
+            heights = [min_h + extra_h * (t / total_t) for t in thicknesses]
+
+        colors = [
+            "#89c2ff",
+            "#ffd166",
+            "#90d39a",
+            "#f4a6a6",
+            "#c9b6ff",
+            "#7fd8d8",
+            "#ffb570",
+            "#c2d36b",
+        ]
+
+        y = y0
+        for i, (layer, layer_h) in enumerate(zip(self.layers, heights), start=1):
+            yn = y1 if i == n else y + layer_h
+            fill = colors[(i - 1) % len(colors)]
+            self.layer_preview.create_rectangle(x0, y, x1, yn, fill=fill, outline="#ffffff", width=1)
+
+            material_name = Path(layer.file_0deg).stem or Path(layer.file_0deg).name or "material"
+            layer_type = "aniso" if layer.anisotropic else "iso"
+            label = f"{i}. {material_name} | {layer.thickness_in:g} in | {layer_type}"
+            max_chars = max(16, int((x1 - x0) / 6.7))
+            if len(label) > max_chars:
+                label = label[: max_chars - 3] + "..."
+            self.layer_preview.create_text(
+                (x0 + x1) * 0.5,
+                (y + yn) * 0.5,
+                text=label,
+                fill="#1f1f1f",
+            )
+            y = yn
+
+        self.layer_preview.create_rectangle(x0, y0, x1, y1, outline="#3a3a3a", width=1)
+
+    def _refresh_layers(self) -> None:
+        self.layer_list.delete(0, tk.END)
+        for i, layer in enumerate(self.layers, start=1):
+            file0 = Path(layer.file_0deg).name or layer.file_0deg
+            if layer.anisotropic:
+                file90 = Path(layer.file_90deg).name or layer.file_90deg
+                desc = (
+                    f"{i}. t={layer.thickness_in:g} in | aniso | pol={layer.polarization_deg:g} deg | "
+                    f"0deg={file0} | 90deg={file90}"
+                )
+            else:
+                desc = f"{i}. t={layer.thickness_in:g} in | iso | file={file0}"
+            self.layer_list.insert(tk.END, desc)
+        self._draw_layer_preview()
+
+    def _add_layer(self) -> None:
+        dlg = LayerDialog(self)
+        self.wait_window(dlg)
+        if dlg.result is not None:
+            self.layers.append(dlg.result)
+            self._refresh_layers()
+
+    def _edit_layer(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("Layer", "Select a layer to edit.")
+            return
+        dlg = LayerDialog(self, self.layers[idx])
+        self.wait_window(dlg)
+        if dlg.result is not None:
+            self.layers[idx] = dlg.result
+            self._refresh_layers()
+            self.layer_list.selection_set(idx)
+
+    def _remove_layer(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("Layer", "Select a layer to remove.")
+            return
+        del self.layers[idx]
+        self._refresh_layers()
+
+    def _move_up(self) -> None:
+        idx = self._selected_idx()
+        if idx is None or idx == 0:
+            return
+        self.layers[idx - 1], self.layers[idx] = self.layers[idx], self.layers[idx - 1]
+        self._refresh_layers()
+        self.layer_list.selection_set(idx - 1)
+
+    def _move_down(self) -> None:
+        idx = self._selected_idx()
+        if idx is None or idx >= len(self.layers) - 1:
+            return
+        self.layers[idx + 1], self.layers[idx] = self.layers[idx], self.layers[idx + 1]
+        self._refresh_layers()
+        self.layer_list.selection_set(idx + 1)
+
+    def _load_layers(self, skiprows: int) -> list[LoadedLayer]:
+        loaded: list[LoadedLayer] = []
+        for i, layer in enumerate(self.layers, start=1):
+            t_m = layer.thickness_in * INCH_TO_M
+            if t_m <= 0:
+                raise ValueError(f"Layer {i}: thickness must be > 0.")
+
+            table_0 = read_material_table(Path(layer.file_0deg), skiprows)
+            table_90 = (
+                read_material_table(Path(layer.file_90deg), skiprows)
+                if layer.anisotropic
+                else None
+            )
+            loaded.append(
+                LoadedLayer(
+                    thickness_m=t_m,
+                    anisotropic=layer.anisotropic,
+                    polarization_deg=layer.polarization_deg,
+                    table_0deg=table_0,
+                    table_90deg=table_90,
+                )
+            )
+        return loaded
+
+    def _set_dashboard_text(self, text: str) -> None:
+        self.dashboard_text.configure(state="normal")
+        self.dashboard_text.delete("1.0", tk.END)
+        self.dashboard_text.insert("1.0", text)
+        self.dashboard_text.configure(state="disabled")
+
+    def _get_selected_metric_grid(self) -> tuple[str, str, list[list[float]]] | None:
+        if self.last_heatmap_results is None:
+            return None
+
+        metric_label = self.heatmap_metric_var.get()
+        metric_key = self.metric_label_to_key.get(metric_label)
+        if metric_key is None:
+            return None
+
+        view_key = self.uncertainty_view_label_to_key.get(
+            self.uncertainty_view_var.get(),
+            "nominal",
+        )
+        base = self.last_heatmap_results[metric_key]
+        if view_key == "nominal":
+            return metric_label, metric_key, base
+
+        if self.last_heatmap_uncertainty_min is None or self.last_heatmap_uncertainty_max is None:
+            return metric_label, metric_key, base
+
+        z_min = self.last_heatmap_uncertainty_min[metric_key]
+        z_max = self.last_heatmap_uncertainty_max[metric_key]
+        if view_key == "min":
+            return f"{metric_label} [min]", metric_key, z_min
+        if view_key == "max":
+            return f"{metric_label} [max]", metric_key, z_max
+        if NUMPY_AVAILABLE:
+            span = (np.asarray(z_max, dtype=float) - np.asarray(z_min, dtype=float)).tolist()
+        else:
+            span = [
+                [z_max[i][j] - z_min[i][j] for j in range(len(z_min[i]))]
+                for i in range(len(z_min))
+            ]
+        return f"{metric_label} [span]", metric_key, span
+
+    def _update_slice_plots(
+        self,
+        angles: list[float],
+        freqs: list[float],
+        z: list[list[float]],
+        metric_label: str,
+    ) -> None:
+        if (
+            self.ax_freq_slice is None
+            or self.ax_angle_slice is None
+            or self.ax_heatmap is None
+            or not angles
+            or not freqs
+        ):
+            return
+
+        if self.selected_angle_idx is None or self.selected_angle_idx >= len(angles):
+            self.selected_angle_idx = len(angles) // 2
+        if self.selected_freq_idx is None or self.selected_freq_idx >= len(freqs):
+            self.selected_freq_idx = len(freqs) // 2
+
+        j = self.selected_angle_idx
+        i = self.selected_freq_idx
+        angle_sel = angles[j]
+        freq_sel = freqs[i]
+
+        freq_slice = [row[j] for row in z]
+        angle_slice = z[i]
+
+        self.ax_freq_slice.clear()
+        self.ax_freq_slice.plot(freqs, freq_slice, color="#0b5fff", linewidth=1.7)
+        self.ax_freq_slice.set_title(
+            f"Frequency Slice @ {angle_sel:g} deg",
+            fontsize=9,
+            pad=2,
+        )
+        self.ax_freq_slice.set_xlabel("Frequency (GHz)", fontsize=8)
+        self.ax_freq_slice.set_ylabel(metric_label, fontsize=8)
+        self.ax_freq_slice.grid(True, alpha=0.2)
+
+        self.ax_angle_slice.clear()
+        self.ax_angle_slice.plot(angles, angle_slice, color="#d84f2a", linewidth=1.7)
+        self.ax_angle_slice.set_title(
+            f"Angle Slice @ {freq_sel:g} GHz",
+            fontsize=9,
+            pad=2,
+        )
+        self.ax_angle_slice.set_xlabel("Angle (deg)", fontsize=8)
+        self.ax_angle_slice.grid(True, alpha=0.2)
+
+        if self.last_heatmap_uncertainty_min is not None and self.last_heatmap_uncertainty_max is not None:
+            metric_key = self.metric_label_to_key[self.heatmap_metric_var.get()]
+            zmin = self.last_heatmap_uncertainty_min[metric_key]
+            zmax = self.last_heatmap_uncertainty_max[metric_key]
+            self.ax_freq_slice.fill_between(
+                freqs,
+                [r[j] for r in zmin],
+                [r[j] for r in zmax],
+                color="#0b5fff",
+                alpha=0.12,
+                linewidth=0,
+            )
+            self.ax_angle_slice.fill_between(
+                angles,
+                zmin[i],
+                zmax[i],
+                color="#d84f2a",
+                alpha=0.12,
+                linewidth=0,
+            )
+
+        self.ax_heatmap.axvline(angle_sel, color="white", linewidth=1.0, linestyle="--", alpha=0.9)
+        self.ax_heatmap.axhline(freq_sel, color="white", linewidth=1.0, linestyle="--", alpha=0.9)
+
+    def _on_plot_click(self, event: object) -> None:
+        if (
+            not MPL_AVAILABLE
+            or self.ax_heatmap is None
+            or self.last_heatmap_results is None
+            or getattr(event, "inaxes", None) is not self.ax_heatmap
+            or getattr(event, "xdata", None) is None
+            or getattr(event, "ydata", None) is None
+        ):
+            return
+
+        angles = self.last_heatmap_results["angle_deg"]
+        freqs = self.last_heatmap_results["freq_ghz"]
+        x = float(event.xdata)
+        y = float(event.ydata)
+        self.selected_angle_idx = min(range(len(angles)), key=lambda idx: abs(angles[idx] - x))
+        self.selected_freq_idx = min(range(len(freqs)), key=lambda idx: abs(freqs[idx] - y))
+        self._update_plot()
+
+    def _draw_plot_placeholder(self, text: str) -> None:
+        if not MPL_AVAILABLE or self.ax_heatmap is None or self.canvas is None:
+            return
+        if self.heatmap_cbar is not None:
+            self.heatmap_cbar.remove()
+            self.heatmap_cbar = None
+        self.ax_heatmap.clear()
+        self.ax_heatmap.set_title("Heatmap")
+        self.ax_heatmap.set_xlabel("Angle (deg)")
+        self.ax_heatmap.set_ylabel("Frequency (GHz)")
+        self.ax_heatmap.text(0.5, 0.5, text, ha="center", va="center", transform=self.ax_heatmap.transAxes)
+        self.ax_heatmap.grid(False)
+        if self.ax_freq_slice is not None:
+            self.ax_freq_slice.clear()
+            self.ax_freq_slice.set_title("Metric vs Frequency", fontsize=9, pad=2)
+            self.ax_freq_slice.set_xlabel("Frequency (GHz)", fontsize=8)
+            self.ax_freq_slice.set_ylabel("Metric", fontsize=8)
+            self.ax_freq_slice.grid(False)
+        if self.ax_angle_slice is not None:
+            self.ax_angle_slice.clear()
+            self.ax_angle_slice.set_title("Metric vs Angle", fontsize=9, pad=2)
+            self.ax_angle_slice.set_xlabel("Angle (deg)", fontsize=8)
+            self.ax_angle_slice.grid(False)
+        self.canvas.draw_idle()
+
+    def _update_plot(self) -> None:
+        if not MPL_AVAILABLE or self.ax_heatmap is None or self.canvas is None:
+            return
+        if self.heatmap_cbar is not None:
+            self.heatmap_cbar.remove()
+            self.heatmap_cbar = None
+
+        if self.last_heatmap_results is None:
+            self._draw_plot_placeholder("Run heatmap mode to populate plot.")
+            return
+
+        selected = self._get_selected_metric_grid()
+        if selected is None:
+            self._draw_plot_placeholder("Select a valid metric.")
+            return
+        metric_label, metric_key, z = selected
+        try:
+            cmin, cmax = self._get_color_limits()
+        except Exception as exc:
+            messagebox.showerror("Colorbar", str(exc))
+            return
+
+        angles = self.last_heatmap_results["angle_deg"]
+        freqs = self.last_heatmap_results["freq_ghz"]
+        self.ax_heatmap.clear()
+        cmap = "magma" if "[span]" in metric_label else ("twilight" if "phase" in metric_key else "viridis")
+        im = self.ax_heatmap.imshow(
+            z,
+            origin="lower",
+            aspect="auto",
+            extent=(angles[0], angles[-1], freqs[0], freqs[-1]),
+            cmap=cmap,
+            vmin=cmin,
+            vmax=cmax,
+        )
+        self.ax_heatmap.set_title(f"{metric_label} vs Angle/Frequency")
+        self.ax_heatmap.set_xlabel("Angle (deg)")
+        self.ax_heatmap.set_ylabel("Frequency (GHz)")
+        self.ax_heatmap.grid(False)
+        self.heatmap_cbar = self.fig.colorbar(im, ax=self.ax_heatmap)
+        if cmin is None or cmax is None:
+            self.heatmap_cbar.set_label(metric_label)
+        else:
+            self.heatmap_cbar.set_label(f"{metric_label} [{cmin:g}, {cmax:g}]")
+
+        self._update_slice_plots(angles, freqs, z, metric_label)
+        self.canvas.draw_idle()
+
+    def _compute_heatmap_data(
+        self,
+        loaded_layers: list[LoadedLayer],
+        wave_pol: str,
+        angles: list[float],
+        thickness_scale: float = 1.0,
+        eps_scale: float = 1.0,
+        mu_scale: float = 1.0,
+    ) -> dict[str, list[list[float]] | list[float]]:
+        f_start = float(self.f_start_var.get().strip())
+        f_stop = float(self.f_stop_var.get().strip())
+        f_step = float(self.f_step_var.get().strip())
+        freqs = make_sweep(f_start, f_stop, f_step)
+
+        for i, layer in enumerate(loaded_layers, start=1):
+            validate_sweep_coverage(freqs, layer.table_0deg, f"layer {i} 0 deg/isotropic")
+            if layer.anisotropic:
+                assert layer.table_90deg is not None
+                validate_sweep_coverage(freqs, layer.table_90deg, f"layer {i} 90 deg")
+
+        if NUMPY_AVAILABLE:
+            grids = {k: np.zeros((len(freqs), len(angles)), dtype=float) for k in HEATMAP_METRIC_KEYS}
+            for j, a in enumerate(angles):
+                col = compute_angle_metrics_many(
+                    freqs,
+                    a,
+                    loaded_layers,
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    grids[key][:, j] = np.asarray(col[key], dtype=float)
+            metric_grids = {k: grids[k].tolist() for k in HEATMAP_METRIC_KEYS}
+        else:
+            metric_grids = {k: [] for k in HEATMAP_METRIC_KEYS}
+            for f_ghz in freqs:
+                row = compute_angle_metrics(
+                    f_ghz,
+                    angles[0],
+                    loaded_layers,
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    metric_grids[key].append([row[key]])
+            for j in range(1, len(angles)):
+                for i, f_ghz in enumerate(freqs):
+                    m = compute_angle_metrics(
+                        f_ghz,
+                        angles[j],
+                        loaded_layers,
+                        wave_pol,
+                        thickness_scale=thickness_scale,
+                        eps_scale=eps_scale,
+                        mu_scale=mu_scale,
+                    )
+                    for key in HEATMAP_METRIC_KEYS:
+                        metric_grids[key][i].append(m[key])
+
+        return {
+            "angle_deg": angles,
+            "freq_ghz": freqs,
+            **metric_grids,
+        }
+
+    def _compute_frequency_mode(
+        self,
+        output_path: Path,
+        include_header: bool,
+        loaded_layers: list[LoadedLayer],
+        backing: str,
+        uncertainty: UncertaintyConfig,
+    ) -> int:
+        f_start = float(self.f_start_var.get().strip())
+        f_stop = float(self.f_stop_var.get().strip())
+        f_step = float(self.f_step_var.get().strip())
+        sweep = make_sweep(f_start, f_stop, f_step)
+
+        for i, layer in enumerate(loaded_layers, start=1):
+            validate_sweep_coverage(sweep, layer.table_0deg, f"layer {i} 0 deg/isotropic")
+            if layer.anisotropic:
+                assert layer.table_90deg is not None
+                validate_sweep_coverage(sweep, layer.table_90deg, f"layer {i} 90 deg")
+
+        z_nom = compute_stack_impedance_many(sweep, loaded_layers, backing)
+        scales = build_uncertainty_scales(uncertainty)
+        envelope_enabled = uncertainty.enabled and len(scales) > 1
+
+        if not envelope_enabled:
+            rows = [(f_ghz, z.real, z.imag) for f_ghz, z in zip(sweep, z_nom)]
+            write_output(output_path, rows, include_header)
+        else:
+            zr_nom = [z.real for z in z_nom]
+            zi_nom = [z.imag for z in z_nom]
+            zr_min = zr_nom.copy()
+            zr_max = zr_nom.copy()
+            zi_min = zi_nom.copy()
+            zi_max = zi_nom.copy()
+            for t_scale, e_scale, m_scale in scales:
+                z_s = compute_stack_impedance_many(
+                    sweep,
+                    loaded_layers,
+                    backing,
+                    thickness_scale=t_scale,
+                    eps_scale=e_scale,
+                    mu_scale=m_scale,
+                )
+                for i, z in enumerate(z_s):
+                    zr = z.real
+                    zi = z.imag
+                    zr_min[i] = min(zr_min[i], zr)
+                    zr_max[i] = max(zr_max[i], zr)
+                    zi_min[i] = min(zi_min[i], zi)
+                    zi_max[i] = max(zi_max[i], zi)
+
+            with output_path.open("w", encoding="utf-8") as f:
+                if include_header:
+                    f.write(
+                        "frequency_GHz z_r z_i z_r_min z_r_max z_i_min z_i_max\n"
+                    )
+                for i, f_ghz in enumerate(sweep):
+                    f.write(
+                        f"{f_ghz:.12g} {zr_nom[i]:.12g} {zi_nom[i]:.12g} "
+                        f"{zr_min[i]:.12g} {zr_max[i]:.12g} {zi_min[i]:.12g} {zi_max[i]:.12g}\n"
+                    )
+
+        self.last_heatmap_results = None
+        self.last_heatmap_uncertainty_min = None
+        self.last_heatmap_uncertainty_max = None
+        self.selected_angle_idx = None
+        self.selected_freq_idx = None
+        wave_pol = normalize_wave_polarization(self.wave_pol_var.get())
+        self._set_dashboard_text(
+            self._summarize_frequency_run(
+                sweep,
+                loaded_layers,
+                wave_pol,
+                envelope_enabled,
+                backing,
+            )
+        )
+        self._update_plot()
+        return len(sweep)
+
+    def _compute_angle_mode(
+        self,
+        output_path: Path,
+        include_header: bool,
+        loaded_layers: list[LoadedLayer],
+        uncertainty: UncertaintyConfig,
+    ) -> int:
+        a_start = float(self.angle_start_var.get().strip())
+        a_stop = float(self.angle_stop_var.get().strip())
+        a_step = float(self.angle_step_var.get().strip())
+        wave_pol = normalize_wave_polarization(self.wave_pol_var.get())
+
+        if a_start < 0 or a_stop > 90:
+            raise ValueError("Angle range must satisfy 0 <= start and stop <= 90 deg.")
+
+        angles = make_sweep(a_start, a_stop, a_step)
+        out = self._compute_heatmap_data(loaded_layers, wave_pol, angles)
+        self.last_heatmap_results = out
+
+        scales = build_uncertainty_scales(uncertainty)
+        envelope_enabled = uncertainty.enabled and len(scales) > 1
+        envelope_min: dict[str, list[list[float]]] | None = None
+        envelope_max: dict[str, list[list[float]]] | None = None
+        if envelope_enabled:
+            if NUMPY_AVAILABLE:
+                envelope_min = {
+                    key: np.asarray(out[key], dtype=float)
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                envelope_max = {
+                    key: np.asarray(out[key], dtype=float)
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                for t_scale, e_scale, m_scale in scales:
+                    s_out = self._compute_heatmap_data(
+                        loaded_layers,
+                        wave_pol,
+                        angles,
+                        thickness_scale=t_scale,
+                        eps_scale=e_scale,
+                        mu_scale=m_scale,
+                    )
+                    for key in HEATMAP_METRIC_KEYS:
+                        arr = np.asarray(s_out[key], dtype=float)
+                        envelope_min[key] = np.minimum(envelope_min[key], arr)
+                        envelope_max[key] = np.maximum(envelope_max[key], arr)
+                envelope_min = {key: envelope_min[key].tolist() for key in HEATMAP_METRIC_KEYS}
+                envelope_max = {key: envelope_max[key].tolist() for key in HEATMAP_METRIC_KEYS}
+            else:
+                envelope_min = {
+                    key: [[v for v in row] for row in out[key]]
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                envelope_max = {
+                    key: [[v for v in row] for row in out[key]]
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                for t_scale, e_scale, m_scale in scales:
+                    s_out = self._compute_heatmap_data(
+                        loaded_layers,
+                        wave_pol,
+                        angles,
+                        thickness_scale=t_scale,
+                        eps_scale=e_scale,
+                        mu_scale=m_scale,
+                    )
+                    for key in HEATMAP_METRIC_KEYS:
+                        for i in range(len(out["freq_ghz"])):
+                            for j in range(len(out["angle_deg"])):
+                                val = s_out[key][i][j]
+                                envelope_min[key][i][j] = min(envelope_min[key][i][j], val)
+                                envelope_max[key][i][j] = max(envelope_max[key][i][j], val)
+
+        freq = out["freq_ghz"]
+        ang = out["angle_deg"]
+        metal_loss = out["metal_loss_db"]
+        metal_phase = out["metal_phase_deg"]
+        air_loss = out["air_loss_db"]
+        air_phase = out["air_phase_deg"]
+        insertion_loss = out["insertion_loss_db"]
+        insertion_phase = out["insertion_phase_deg"]
+
+        with output_path.open("w", encoding="utf-8") as f:
+            if include_header:
+                if envelope_enabled:
+                    f.write(
+                        "frequency_GHz angle_deg "
+                        "metal_loss_db metal_loss_db_min metal_loss_db_max "
+                        "metal_phase_deg metal_phase_deg_min metal_phase_deg_max "
+                        "air_loss_db air_loss_db_min air_loss_db_max "
+                        "air_phase_deg air_phase_deg_min air_phase_deg_max "
+                        "insertion_loss_db insertion_loss_db_min insertion_loss_db_max "
+                        "insertion_phase_deg insertion_phase_deg_min insertion_phase_deg_max\n"
+                    )
+                else:
+                    f.write(
+                        "frequency_GHz angle_deg metal_loss_db metal_phase_deg "
+                        "air_loss_db air_phase_deg insertion_loss_db insertion_phase_deg\n"
+                    )
+            for i, f_ghz in enumerate(freq):
+                for j, a in enumerate(ang):
+                    if envelope_enabled:
+                        assert envelope_min is not None
+                        assert envelope_max is not None
+                        f.write(
+                            f"{f_ghz:.12g} {a:.12g} "
+                            f"{metal_loss[i][j]:.12g} "
+                            f"{envelope_min['metal_loss_db'][i][j]:.12g} {envelope_max['metal_loss_db'][i][j]:.12g} "
+                            f"{metal_phase[i][j]:.12g} "
+                            f"{envelope_min['metal_phase_deg'][i][j]:.12g} {envelope_max['metal_phase_deg'][i][j]:.12g} "
+                            f"{air_loss[i][j]:.12g} "
+                            f"{envelope_min['air_loss_db'][i][j]:.12g} {envelope_max['air_loss_db'][i][j]:.12g} "
+                            f"{air_phase[i][j]:.12g} "
+                            f"{envelope_min['air_phase_deg'][i][j]:.12g} {envelope_max['air_phase_deg'][i][j]:.12g} "
+                            f"{insertion_loss[i][j]:.12g} "
+                            f"{envelope_min['insertion_loss_db'][i][j]:.12g} {envelope_max['insertion_loss_db'][i][j]:.12g} "
+                            f"{insertion_phase[i][j]:.12g} "
+                            f"{envelope_min['insertion_phase_deg'][i][j]:.12g} {envelope_max['insertion_phase_deg'][i][j]:.12g}\n"
+                        )
+                    else:
+                        f.write(
+                            f"{f_ghz:.12g} {a:.12g} "
+                            f"{metal_loss[i][j]:.12g} {metal_phase[i][j]:.12g} "
+                            f"{air_loss[i][j]:.12g} {air_phase[i][j]:.12g} "
+                            f"{insertion_loss[i][j]:.12g} {insertion_phase[i][j]:.12g}\n"
+                        )
+
+        self.last_heatmap_uncertainty_min = envelope_min
+        self.last_heatmap_uncertainty_max = envelope_max
+        self.selected_angle_idx = None
+        self.selected_freq_idx = None
+        self._set_dashboard_text(self._summarize_angle_run(out, wave_pol, envelope_enabled))
+        self._update_plot()
+        return len(freq) * len(ang)
+
+    def _thickness_candidates(self, t_min: float, t_max: float, t_steps: int) -> list[float]:
+        if t_min <= 0 or t_max <= 0:
+            raise ValueError("Optimization thickness bounds must be > 0.")
+        if t_max < t_min:
+            raise ValueError("Optimization thickness max must be >= min.")
+        if t_steps <= 0:
+            raise ValueError("Optimization thickness steps must be >= 1.")
+        if t_steps == 1:
+            return [t_min]
+        return [t_min + i * (t_max - t_min) / (t_steps - 1) for i in range(t_steps)]
+
+    def _discover_material_candidates(self, skiprows: int) -> list[str]:
+        out: list[str] = []
+        for p in sorted(Path(".").glob("*.txt")):
+            try:
+                read_material_table(p, skiprows)
+            except Exception:
+                continue
+            out.append(str(p))
+        return out
+
+    def _read_inverse_uncertainty_config(self) -> UncertaintyConfig:
+        if not self.inv_uncertainty_var.get():
+            return UncertaintyConfig(enabled=False, thickness_pct=0.0, eps_pct=0.0, mu_pct=0.0)
+
+        t_pct = float(self.inv_unc_t_pct_var.get().strip())
+        eps_pct = float(self.inv_unc_eps_pct_var.get().strip())
+        mu_pct = float(self.inv_unc_mu_pct_var.get().strip())
+        if t_pct < 0 or eps_pct < 0 or mu_pct < 0:
+            raise ValueError("Inverse-design uncertainty percentages must be >= 0.")
+        return UncertaintyConfig(enabled=True, thickness_pct=t_pct, eps_pct=eps_pct, mu_pct=mu_pct)
+
+    def _score_inverse_candidate(
+        self,
+        target_freqs: list[float],
+        target_angles: list[float],
+        candidate_layers: list[LoadedLayer],
+        wave_pol: str,
+        scales: list[tuple[float, float, float]],
+        score_mode: str,
+    ) -> tuple[float, float, float, float, float]:
+        corner_means: list[float] = []
+        nominal_mean: float | None = None
+        for t_scale, e_scale, m_scale in scales:
+            values: list[float] = []
+            for angle_deg in target_angles:
+                metrics = compute_angle_metrics_many(
+                    target_freqs,
+                    angle_deg,
+                    candidate_layers,
+                    wave_pol,
+                    thickness_scale=t_scale,
+                    eps_scale=e_scale,
+                    mu_scale=m_scale,
+                )
+                values.extend(metrics["metal_loss_db"])
+            mean_db, _mn, _mx = self._stats(values)
+            corner_means.append(mean_db)
+            if abs(t_scale - 1.0) < 1e-12 and abs(e_scale - 1.0) < 1e-12 and abs(m_scale - 1.0) < 1e-12:
+                nominal_mean = mean_db
+
+        if not corner_means:
+            raise ValueError("No corner scores computed for inverse candidate.")
+        if nominal_mean is None:
+            nominal_mean = corner_means[0]
+
+        worst_mean = min(corner_means)
+        avg_mean = sum(corner_means) / len(corner_means)
+        best_mean = max(corner_means)
+        score_db = worst_mean if "worst-case" in score_mode.lower() else avg_mean
+        return score_db, nominal_mean, worst_mean, avg_mean, best_mean
+
+    def _refresh_inverse_results_list(self) -> None:
+        if self.inv_results_list is None:
+            return
+        self.inv_results_list.delete(0, tk.END)
+        for i, c in enumerate(self.inverse_candidates, start=1):
+            t_text = ", ".join(f"{t:.4g}" for t in c.thickness_in)
+            m_text = ", ".join(Path(p).name for p in c.material_files)
+            line = (
+                f"{i:02d}: score={c.score_db:.3f} dB | nom={c.nominal_mean_db:.3f} | "
+                f"worst={c.worst_mean_db:.3f} | avg={c.avg_mean_db:.3f} | "
+                f"t=[{t_text}] | m=[{m_text}]"
+            )
+            self.inv_results_list.insert(tk.END, line)
+
+    def _apply_inverse_candidate(self) -> None:
+        try:
+            if not self.inverse_candidates or self.inv_results_list is None:
+                messagebox.showwarning("Inverse Design", "Run inverse design first.")
+                return
+            sel = self.inv_results_list.curselection()
+            if not sel:
+                messagebox.showwarning("Inverse Design", "Select a candidate to apply.")
+                return
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(self.inverse_candidates):
+                messagebox.showwarning("Inverse Design", "Selected candidate is out of range.")
+                return
+
+            cand = self.inverse_candidates[idx]
+            if len(cand.thickness_in) != len(self.layers) or len(cand.material_files) != len(self.layers):
+                raise ValueError("Layer count changed since inverse design run. Re-run inverse design.")
+
+            for i, layer in enumerate(self.layers):
+                layer.thickness_in = cand.thickness_in[i]
+                if not layer.anisotropic:
+                    layer.file_0deg = cand.material_files[i]
+            self._refresh_layers()
+
+            msg = (
+                f"Applied inverse candidate #{idx + 1}.\n"
+                f"Score: {cand.score_db:.3f} dB | Nominal: {cand.nominal_mean_db:.3f} dB | "
+                f"Worst-case: {cand.worst_mean_db:.3f} dB"
+            )
+            self._set_dashboard_text(msg)
+            messagebox.showinfo("Inverse Design", msg)
+        except Exception as exc:
+            messagebox.showerror("Inverse Design Error", str(exc))
+
+    def _run_inverse_design(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer before inverse design.")
+
+            skiprows = int(self.skiprows_var.get().strip())
+            wave_pol = normalize_wave_polarization(self.inv_wave_pol_var.get())
+            f_start = float(self.inv_target_start_var.get().strip())
+            f_stop = float(self.inv_target_stop_var.get().strip())
+            f_step = float(self.inv_target_step_var.get().strip())
+            a_start = float(self.inv_angle_start_var.get().strip())
+            a_stop = float(self.inv_angle_stop_var.get().strip())
+            a_step = float(self.inv_angle_step_var.get().strip())
+            target_freqs = make_sweep(f_start, f_stop, f_step)
+            target_angles = make_sweep(a_start, a_stop, a_step)
+
+            t_min = float(self.inv_thick_min_var.get().strip())
+            t_max = float(self.inv_thick_max_var.get().strip())
+            t_steps = int(self.inv_thick_steps_var.get().strip())
+            max_evals = int(self.inv_max_evals_var.get().strip())
+            top_n = int(self.inv_top_n_var.get().strip())
+            if max_evals <= 0:
+                raise ValueError("Inverse-design Max evals must be >= 1.")
+            if top_n <= 0:
+                raise ValueError("Inverse-design Top N must be >= 1.")
+
+            thickness_grid = self._thickness_candidates(t_min, t_max, t_steps)
+            score_mode = self.inv_score_mode_var.get().strip()
+            uncertainty_cfg = self._read_inverse_uncertainty_config()
+            scales = build_uncertainty_scales(uncertainty_cfg)
+
+            material_mode = self.inv_material_mode_var.get().strip().lower()
+            search_materials = "search" in material_mode
+            material_pool = self._discover_material_candidates(skiprows) if search_materials else []
+            if search_materials and not material_pool:
+                raise ValueError("No valid material tables (*.txt) found for inverse-design material search mode.")
+
+            layer_material_options: list[list[str]] = []
+            for layer in self.layers:
+                if layer.anisotropic:
+                    layer_material_options.append([layer.file_0deg])
+                elif search_materials:
+                    layer_material_options.append(material_pool)
+                else:
+                    layer_material_options.append([layer.file_0deg])
+
+            thickness_combo_count = len(thickness_grid) ** len(self.layers)
+            material_combo_count = 1
+            for opts in layer_material_options:
+                material_combo_count *= max(1, len(opts))
+            total_combo_count = thickness_combo_count * material_combo_count
+
+            table_cache: dict[str, MaterialTable] = {}
+
+            def get_table(path_str: str) -> MaterialTable:
+                key = str(Path(path_str))
+                if key not in table_cache:
+                    table_cache[key] = read_material_table(Path(key), skiprows)
+                return table_cache[key]
+
+            top_candidates: list[InverseCandidate] = []
+            eval_count = 0
+            skipped_out_of_range = 0
+            stop = False
+
+            material_index_ranges = [range(len(opts)) for opts in layer_material_options]
+            for mat_indices in product(*material_index_ranges):
+                chosen_files = [layer_material_options[i][idx] for i, idx in enumerate(mat_indices)]
+                candidate_tables_0: list[MaterialTable] = []
+                candidate_tables_90: list[MaterialTable | None] = []
+                coverage_ok = True
+                for i, layer in enumerate(self.layers, start=1):
+                    table_0 = get_table(chosen_files[i - 1])
+                    try:
+                        validate_sweep_coverage(target_freqs, table_0, f"inverse layer {i} 0deg/isotropic")
+                    except Exception:
+                        coverage_ok = False
+                        break
+                    table_90: MaterialTable | None = None
+                    if layer.anisotropic:
+                        table_90 = get_table(layer.file_90deg)
+                        try:
+                            validate_sweep_coverage(target_freqs, table_90, f"inverse layer {i} 90deg")
+                        except Exception:
+                            coverage_ok = False
+                            break
+                    candidate_tables_0.append(table_0)
+                    candidate_tables_90.append(table_90)
+                if not coverage_ok:
+                    skipped_out_of_range += len(thickness_grid) ** len(self.layers)
+                    continue
+
+                for thicknesses in product(thickness_grid, repeat=len(self.layers)):
+                    eval_count += 1
+                    candidate_layers: list[LoadedLayer] = []
+                    for i, layer in enumerate(self.layers):
+                        candidate_layers.append(
+                            LoadedLayer(
+                                thickness_m=thicknesses[i] * INCH_TO_M,
+                                anisotropic=layer.anisotropic,
+                                polarization_deg=layer.polarization_deg,
+                                table_0deg=candidate_tables_0[i],
+                                table_90deg=candidate_tables_90[i],
+                            )
+                        )
+
+                    score_db, nominal_mean, worst_mean, avg_mean, best_mean = self._score_inverse_candidate(
+                        target_freqs,
+                        target_angles,
+                        candidate_layers,
+                        wave_pol,
+                        scales,
+                        score_mode,
+                    )
+                    top_candidates.append(
+                        InverseCandidate(
+                            score_db=score_db,
+                            nominal_mean_db=nominal_mean,
+                            worst_mean_db=worst_mean,
+                            avg_mean_db=avg_mean,
+                            best_mean_db=best_mean,
+                            thickness_in=[float(v) for v in thicknesses],
+                            material_files=chosen_files[:],
+                        )
+                    )
+                    top_candidates.sort(key=lambda c: c.score_db, reverse=True)
+                    if len(top_candidates) > top_n:
+                        top_candidates.pop()
+
+                    if eval_count >= max_evals:
+                        stop = True
+                        break
+                if stop:
+                    break
+
+            if not top_candidates:
+                raise ValueError("Inverse design found no valid candidates in the target region.")
+
+            self.inverse_candidates = top_candidates
+            self._refresh_inverse_results_list()
+            if self.inv_results_list is not None:
+                self.inv_results_list.selection_clear(0, tk.END)
+                self.inv_results_list.selection_set(0)
+
+            best = self.inverse_candidates[0]
+            unc_state = "enabled" if uncertainty_cfg.enabled else "disabled"
+            msg = (
+                f"Inverse design complete.\n"
+                f"Objective: {score_mode}\n"
+                f"Region: {f_start:g}-{f_stop:g} GHz, {a_start:g}-{a_stop:g} deg, pol={wave_pol.upper()}\n"
+                f"Uncertainty: {unc_state} ({len(scales)} corner(s))\n"
+                f"Evaluated: {eval_count} candidates (limit {max_evals}, theoretical {total_combo_count})\n"
+                f"Skipped out-of-range combos (estimated): {skipped_out_of_range}\n"
+                f"Best score: {best.score_db:.3f} dB | nominal {best.nominal_mean_db:.3f} dB | "
+                f"worst-case {best.worst_mean_db:.3f} dB\n"
+                f"Stored top {len(self.inverse_candidates)} candidates. Use Apply Selected to update the stack."
+            )
+            self._set_dashboard_text(msg)
+            messagebox.showinfo("Inverse Design", msg)
+        except Exception as exc:
+            messagebox.showerror("Inverse Design Error", str(exc))
+
+    def _optimize(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer before optimizing.")
+
+            skiprows = int(self.skiprows_var.get().strip())
+            wave_pol = normalize_wave_polarization(self.wave_pol_var.get())
+            f_start = float(self.opt_target_start_var.get().strip())
+            f_stop = float(self.opt_target_stop_var.get().strip())
+            f_step = float(self.opt_target_step_var.get().strip())
+            target_freqs = make_sweep(f_start, f_stop, f_step)
+            t_min = float(self.opt_thick_min_var.get().strip())
+            t_max = float(self.opt_thick_max_var.get().strip())
+            t_steps = int(self.opt_thick_steps_var.get().strip())
+            max_evals = int(self.opt_max_evals_var.get().strip())
+            if max_evals <= 0:
+                raise ValueError("Max evals must be >= 1.")
+
+            thickness_grid = self._thickness_candidates(t_min, t_max, t_steps)
+            material_mode = self.opt_material_mode_var.get().strip().lower()
+            search_materials = "search" in material_mode
+            material_pool = self._discover_material_candidates(skiprows) if search_materials else []
+            if search_materials and not material_pool:
+                raise ValueError("No valid material tables (*.txt) found for material search mode.")
+
+            layer_material_options: list[list[str]] = []
+            for layer in self.layers:
+                if layer.anisotropic:
+                    layer_material_options.append([layer.file_0deg])
+                elif search_materials:
+                    layer_material_options.append(material_pool)
+                else:
+                    layer_material_options.append([layer.file_0deg])
+
+            thickness_combo_count = len(thickness_grid) ** len(self.layers)
+            material_combo_count = 1
+            for opts in layer_material_options:
+                material_combo_count *= max(1, len(opts))
+            total_combo_count = thickness_combo_count * material_combo_count
+
+            table_cache: dict[str, MaterialTable] = {}
+
+            def get_table(path_str: str) -> MaterialTable:
+                key = str(Path(path_str))
+                if key not in table_cache:
+                    table_cache[key] = read_material_table(Path(key), skiprows)
+                return table_cache[key]
+
+            best_score = float("-inf")
+            best_layers: list[LoadedLayer] | None = None
+            best_material_files: list[str] | None = None
+            best_thicknesses: list[float] | None = None
+            eval_count = 0
+            skipped_out_of_range = 0
+            stop = False
+
+            material_index_ranges = [range(len(opts)) for opts in layer_material_options]
+            for mat_indices in product(*material_index_ranges):
+                chosen_files = [layer_material_options[i][idx] for i, idx in enumerate(mat_indices)]
+                candidate_tables_0: list[MaterialTable] = []
+                candidate_tables_90: list[MaterialTable | None] = []
+                coverage_ok = True
+                for i, layer in enumerate(self.layers, start=1):
+                    table_0 = get_table(chosen_files[i - 1])
+                    try:
+                        validate_sweep_coverage(target_freqs, table_0, f"opt layer {i} 0deg/isotropic")
+                    except Exception:
+                        coverage_ok = False
+                        break
+                    table_90: MaterialTable | None = None
+                    if layer.anisotropic:
+                        table_90 = get_table(layer.file_90deg)
+                        try:
+                            validate_sweep_coverage(target_freqs, table_90, f"opt layer {i} 90deg")
+                        except Exception:
+                            coverage_ok = False
+                            break
+                    candidate_tables_0.append(table_0)
+                    candidate_tables_90.append(table_90)
+                if not coverage_ok:
+                    skipped_out_of_range += len(thickness_grid) ** len(self.layers)
+                    continue
+
+                for thicknesses in product(thickness_grid, repeat=len(self.layers)):
+                    eval_count += 1
+                    candidate_layers: list[LoadedLayer] = []
+                    for i, layer in enumerate(self.layers):
+                        candidate_layers.append(
+                            LoadedLayer(
+                                thickness_m=thicknesses[i] * INCH_TO_M,
+                                anisotropic=layer.anisotropic,
+                                polarization_deg=layer.polarization_deg,
+                                table_0deg=candidate_tables_0[i],
+                                table_90deg=candidate_tables_90[i],
+                            )
+                        )
+                    metrics = compute_angle_metrics_many(target_freqs, 0.0, candidate_layers, wave_pol)
+                    score, _mn, _mx = self._stats(metrics["metal_loss_db"])
+                    if score > best_score:
+                        best_score = score
+                        best_layers = candidate_layers
+                        best_material_files = chosen_files[:]
+                        best_thicknesses = [float(v) for v in thicknesses]
+
+                    if eval_count >= max_evals:
+                        stop = True
+                        break
+                if stop:
+                    break
+
+            if best_layers is None or best_material_files is None or best_thicknesses is None:
+                raise ValueError("Optimization found no valid candidates in the target band.")
+
+            for i, layer in enumerate(self.layers):
+                layer.thickness_in = best_thicknesses[i]
+                if not layer.anisotropic:
+                    layer.file_0deg = best_material_files[i]
+            self._refresh_layers()
+
+            metrics_best = compute_angle_metrics_many(target_freqs, 0.0, best_layers, wave_pol)
+            bw10 = self._max_contiguous_bandwidth(target_freqs, metrics_best["metal_loss_db"], 10.0)
+            msg = (
+                f"Optimization complete.\n"
+                f"Evaluated: {eval_count} candidates (limit {max_evals}, theoretical {total_combo_count})\n"
+                f"Skipped out-of-range combos (estimated): {skipped_out_of_range}\n"
+                f"Best avg metal-backed loss over {f_start:g}-{f_stop:g} GHz @ 0 deg: {best_score:.3f} dB\n"
+                f"Best contiguous >=10 dB bandwidth: {bw10:.3f} GHz"
+            )
+            self._set_dashboard_text(msg)
+            messagebox.showinfo(
+                "Optimization",
+                msg + "\n\nLayer stack has been updated to the best candidate.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Optimization Error", str(exc))
+
+    def _compute(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer.")
+
+            angle_mode = self.angle_mode_var.get()
+            skiprows = int(self.skiprows_var.get().strip())
+            output_path = Path(self.output_var.get().strip())
+            include_header = self.header_var.get()
+            uncertainty = self._read_uncertainty_config()
+            loaded_layers = self._load_layers(skiprows)
+
+            if angle_mode:
+                n = self._compute_angle_mode(output_path, include_header, loaded_layers, uncertainty)
+                messagebox.showinfo(
+                    "Complete",
+                    f"Wrote {n} heatmap points to:\n{output_path}",
+                )
+            else:
+                backing = normalize_backing(self.backing_var.get())
+                n = self._compute_frequency_mode(
+                    output_path,
+                    include_header,
+                    loaded_layers,
+                    backing,
+                    uncertainty,
+                )
+                messagebox.showinfo(
+                    "Complete",
+                    f"Wrote {n} frequency points to:\n{output_path}",
+                )
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+
+
+def main() -> None:
+    if not TK_AVAILABLE:
+        raise SystemExit(
+            "Tkinter is not available. Install Tk support for Python to run the GUI."
+        )
+    app = ImpedanceGui()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
